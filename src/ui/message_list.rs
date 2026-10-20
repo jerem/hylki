@@ -345,6 +345,8 @@ struct ViewSnapshot {
     total_matches: usize,
     thread_drag: crate::ui::message_row::ThreadDragKeys,
     window: usize,
+    /// Its rows stop short of its messages (see [`ROWS_AHEAD`]).
+    tail_stale: bool,
 }
 
 /// How many views the list keeps as built: the unified rows built ahead
@@ -553,6 +555,13 @@ impl std::fmt::Debug for SourceThreads {
 /// How many of a large list's newest messages go on screen while its
 /// conversations are worked out (see `MessageList::threads_pending`).
 const PREVIEW_ROWS: usize = 2000;
+
+/// How many rows past the window are built and held ready to scroll into.
+/// Describing a row is cheap but a mailbox has hundreds of thousands of
+/// them, and nobody reads past the first few screens of a folder before
+/// something else happens: past this the rows are left unbuilt and
+/// `tail_stale` says so, and scrolling that far builds them then.
+const ROWS_AHEAD: usize = 5_000;
 
 /// A list at least this long works out its conversations on a background
 /// thread, and keeps its rows until the answer is in; below it, the work is
@@ -1752,13 +1761,13 @@ impl SimpleComponent for MessageList {
                     // the list shows them.
                     gtk::Button {
                         #[watch]
-                        set_icon_name: if model.selection_any_unread() {
+                        set_icon_name: if model.selection_shows_unread() {
                             "hylki-mail-read-symbolic"
                         } else {
                             "mail-unread-symbolic"
                         },
                         #[watch]
-                        set_tooltip_text: Some(if model.selection_any_unread() { i18n("Mark as Read") } else { i18n("Mark as Unread") }.as_str()),
+                        set_tooltip_text: Some(if model.selection_shows_unread() { i18n("Mark as Read") } else { i18n("Mark as Unread") }.as_str()),
                         add_css_class: "flat",
                         set_focus_on_click: false,
                         #[watch]
@@ -3552,9 +3561,13 @@ impl SimpleComponent for MessageList {
                 let asked = key;
                 self.stop_checking(&sender);
                 // A row further down than the window reaches comes on screen.
-                // Messages that joined quietly are not among the rows past
-                // the window yet, and the row asked for may be one of them.
+                // The rows stop a little past the window, so the one asked
+                // for may not be built: build as far down as its own message
+                // sits, which a row never sits further down than.
                 if self.tail_stale {
+                    if let Some(at) = self.all.iter().position(|m| (m.account_id, m.id) == key) {
+                        self.window = self.window.max(at + 1);
+                    }
                     self.rebuild_rows();
                 }
                 if let Some(at) = self.tail.iter().position(|r| (r.msg.account_id, r.msg.id) == key) {
@@ -3926,6 +3939,24 @@ impl MessageList {
 
     /// Whether any selected message is unread, so the bulk read toggle
     /// marks the selection read rather than unread.
+    /// What the Mark as Read button shows, which the view asks after every
+    /// update. Until a large list's conversations are in, it speaks for the
+    /// rows alone and settles a moment later, rather than working out every
+    /// conversation in the mailbox to answer a button's icon.
+    fn selection_shows_unread(&self) -> bool {
+        let positions = self.selected_positions();
+        if positions.iter().any(|&p| self.shown.get(p).is_some_and(|m| m.unread)) {
+            return true;
+        }
+        if !self.threading {
+            return false;
+        }
+        let Some(threads) = self.threads_if_known() else {
+            return false;
+        };
+        self.any_unread_in_conversations(&positions, &threads)
+    }
+
     fn selection_any_unread(&self) -> bool {
         // The rows first: asked on every update, and a row's own message
         // usually answers it.
@@ -3939,6 +3970,12 @@ impl MessageList {
         // Then the rest of each conversation a row stands for, as
         // `selected_conversations` gathers it, without copying any.
         let threads = self.source_threads();
+        self.any_unread_in_conversations(&positions, &threads)
+    }
+
+    /// Whether any message hidden inside the selected rows' conversations is
+    /// unread.
+    fn any_unread_in_conversations(&self, positions: &[usize], threads: &SourceThreads) -> bool {
         let source = self.active_source();
         positions.iter().filter_map(|&p| self.shown.get(p)).any(|m| {
             let key = (m.account_id, m.id);
@@ -4608,7 +4645,7 @@ impl MessageList {
     /// still being worked out.
     fn keep_view(&mut self) {
         let Some(key) = self.view_key else { return };
-        if !self.loaded || !self.query.is_empty() || self.all.is_empty() || self.tail_stale {
+        if !self.loaded || !self.query.is_empty() || self.all.is_empty() {
             return;
         }
         let threads = self.source_threads.borrow().clone();
@@ -4635,6 +4672,7 @@ impl MessageList {
             total_matches: self.total_matches,
             thread_drag: std::mem::take(&mut *self.shared.thread_drag.borrow_mut()),
             window: self.window,
+            tail_stale: self.tail_stale,
         };
         self.views.retain(|v| v.key != key);
         self.views.push_front(snap);
@@ -4704,6 +4742,7 @@ impl MessageList {
         *self.shared.thread_drag.borrow_mut() = snap.thread_drag;
         self.shown = snap.shown;
         self.window = snap.window;
+        self.tail_stale = snap.tail_stale;
         let stale = self.look_stale.take();
         if !self.shared.model.replace(snap.rows, stale) && stale {
             self.shared.refresh_all();
@@ -4738,6 +4777,7 @@ impl MessageList {
         let window = std::mem::replace(&mut self.window, LIST_WINDOW);
         let selected_ids = std::mem::take(&mut self.selected_ids);
         let selected_id = self.selected_id.take();
+        let tail_stale = std::mem::replace(&mut self.tail_stale, false);
 
         let built = self.compute_rows(true);
         let snap = ViewSnapshot {
@@ -4757,6 +4797,7 @@ impl MessageList {
             total_matches: std::mem::replace(&mut self.total_matches, total_matches),
             thread_drag: std::mem::replace(&mut *self.shared.thread_drag.borrow_mut(), thread_drag),
             window: std::mem::replace(&mut self.window, window),
+            tail_stale: std::mem::replace(&mut self.tail_stale, tail_stale),
         };
         *self.source_threads.borrow_mut() = source_threads;
         self.selected_ids = selected_ids;
@@ -4826,6 +4867,20 @@ impl MessageList {
 
     fn searching_pool(&self) -> bool {
         self.wants_pool() && !self.search_pool.is_empty()
+    }
+
+    /// The conversations of `active_source`, but only when they are already
+    /// worked out, or cheap enough to work out in place. A large list has
+    /// them worked out on a background thread (see
+    /// [`MessageList::threads_pending`]), and a question asked on every
+    /// update must not be the thing that pays for them: for 342k messages
+    /// that is close to half a second, on the main thread, after every sync.
+    fn threads_if_known(&self) -> Option<std::rc::Rc<SourceThreads>> {
+        let pool = self.searching_pool();
+        if let Some(t) = self.source_threads.borrow().as_ref().filter(|t| t.pool == pool) {
+            return Some(t.clone());
+        }
+        (self.active_source().len() < THREADS_OFF_MAIN).then(|| self.source_threads())
     }
 
     /// The conversations of `active_source`, from the kept copy while the
@@ -5110,7 +5165,6 @@ impl MessageList {
 
     fn rebuild_rows(&mut self) {
         let t_rebuild = std::time::Instant::now();
-        self.tail_stale = false;
         let Built { rows, by_date, any_expanded } = self.compute_rows(false);
         // Only what changed reaches the view: rows that show the same message
         // stay where they are, with whatever they were doing (#323).
@@ -5270,9 +5324,21 @@ impl MessageList {
         ));
         let mut any_expanded = false;
         let full_rows = self.window.max(LIST_WINDOW);
+        // Rows are built as far as the window reaches plus what scrolling is
+        // likely to want, and no further: a mailbox's own list is hundreds of
+        // thousands of rows, and building every one of them was the greater
+        // part of this.
+        let horizon = full_rows.saturating_add(ROWS_AHEAD);
+        let mut short = false;
         let mut unseen: std::collections::HashSet<(u32, u32)> =
             self.selected_ids.iter().copied().chain(self.selected_id).collect();
         for key in &order {
+            // Past the horizon, once every selected row has been built (the
+            // selection has to be reachable, however far down it sits).
+            if rows.len() >= horizon && unseen.is_empty() {
+                short = true;
+                break;
+            }
             let mut msgs = groups.remove(key).unwrap();
             let section = day_starts.as_ref().map_or(DaySection::None, |d| DaySection::of(msgs[0].timestamp, d));
             // A conversation reads like a transcript: the message that started it
@@ -5376,6 +5442,9 @@ impl MessageList {
         shown.truncate(limit);
         self.window = limit.max(LIST_WINDOW);
         self.shown = shown;
+        // What was not built is built by whatever reaches for it. A view
+        // built ahead carries this into its snapshot, like the rest.
+        self.tail_stale = short;
         Built { rows, by_date, any_expanded }
     }
 

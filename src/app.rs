@@ -1835,6 +1835,8 @@ pub enum AppMsg {
     ListColumnWidths(std::collections::HashMap<config::ListColumn, i32>),
     /// Build the Settings window ahead of its first open (see the handler).
     PrewarmSettings,
+    /// The second half of the prewarm: lay the built window out.
+    PrewarmSettingsLayout,
     /// Close the Settings window as the user would (the showcase's reopen
     /// timing).
     DebugCloseSettings,
@@ -6111,7 +6113,8 @@ impl SimpleComponent for AppModel {
             });
         }
         {
-            // Settings, built hidden a moment after startup (see PrewarmSettings).
+            // Settings, built hidden once the start has settled (see
+            // PrewarmSettings).
             let s = sender.clone();
             gtk::glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
                 s.input(AppMsg::PrewarmSettings);
@@ -11304,16 +11307,34 @@ impl SimpleComponent for AppModel {
             }
 
             AppMsg::PrewarmSettings => {
-                if self.prefs.is_none() {
-                    self.build_settings_window(&sender, self.settings_open_accounts);
-                    if let Some(p) = &self.prefs {
-                        let w = p.widget();
-                        WidgetExt::realize(w);
-                        // Measuring runs the first CSS pass and Pango layouts
-                        // now, so the first frame after present has less to do.
-                        let _ = w.measure(gtk::Orientation::Horizontal, -1);
-                        let _ = w.measure(gtk::Orientation::Vertical, 920);
-                    }
+                if self.prefs.is_some() {
+                    return;
+                }
+                // Not while the start is still landing. Building this window
+                // is a third of a second of widgets, and spending it between
+                // the first syncs is what makes the window feel stuck; the
+                // point of building it early is a Settings click that opens
+                // at once, and that is just as true a few seconds later.
+                if self.starting_up() {
+                    let s = sender.input_sender().clone();
+                    gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+                        let _ = s.send(AppMsg::PrewarmSettings);
+                    });
+                    return;
+                }
+                self.build_settings_window(&sender, self.settings_open_accounts);
+                // Laying it out is the other half, and it waits for the next
+                // turn of the loop so the two are never one long pause.
+                sender.input(AppMsg::PrewarmSettingsLayout);
+            }
+            AppMsg::PrewarmSettingsLayout => {
+                if let Some(p) = &self.prefs {
+                    let w = p.widget();
+                    WidgetExt::realize(w);
+                    // Measuring runs the first CSS pass and Pango layouts
+                    // now, so the first frame after present has less to do.
+                    let _ = w.measure(gtk::Orientation::Horizontal, -1);
+                    let _ = w.measure(gtk::Orientation::Vertical, 920);
                 }
             }
 
@@ -21356,6 +21377,17 @@ impl AppModel {
     fn forget_threads(&mut self, account_id: u32) {
         self.thread_cache.retain(|(aid, _, _), _| *aid != account_id);
         self.thread_cache_order.retain(|(aid, _, _)| *aid != account_id);
+    }
+
+    /// Whether the start is still landing: folders still to read, views
+    /// still to build, or a merge still queued. Work that can wait, waits
+    /// for this to pass rather than taking its turn among the first syncs.
+    fn starting_up(&self) -> bool {
+        self.preload_due
+            || self.prebuild_due
+            || !self.prebuild_queue.is_empty()
+            || self.unified_emit_queued.get()
+            || !self.unified_unfilled.is_empty()
     }
 
     /// Reply headers for every cached message, so the list can see that two

@@ -10,6 +10,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -228,7 +229,7 @@ impl DaySection {
 /// One row's worth of the list: the message and what the row says about it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowData {
-    pub msg: Rc<Message>,
+    pub msg: Arc<Message>,
     pub meta: RowMeta,
     /// The date heading it sits under (#435): a conversation's replies share
     /// their head's.

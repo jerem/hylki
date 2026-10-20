@@ -2,6 +2,7 @@
 //! routing between the sidebar, list, reader, and the per-account mail workers.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use adw::prelude::*;
 use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
@@ -774,7 +775,7 @@ pub struct AppModel {
     unified_account: Option<u32>,
     /// (account, folder) → that folder's latest messages, for the unified
     /// view's merge.
-    unified_slices: HashMap<(u32, u32), Vec<Message>>,
+    unified_slices: HashMap<(u32, u32), Vec<Arc<Message>>>,
     /// Accounts whose inbox has been requested for the unified view since
     /// launch (the cache-primed slices still need their catch-up sync).
     unified_boot_requested: HashSet<u32>,
@@ -783,7 +784,7 @@ pub struct AppModel {
     /// (account_id, folder_id) → last-seen message list, shown instantly on
     /// revisit while a fresh sync runs in the background. Only folders
     /// listed whole this run: a cross-folder search reads the rest from disk.
-    message_cache: HashMap<(u32, u32), Vec<Message>>,
+    message_cache: HashMap<(u32, u32), Vec<Arc<Message>>>,
     /// Bumped as a search starts and ends, so a pool read from disk for a
     /// search already over is dropped (#472).
     search_gen: u64,
@@ -1160,7 +1161,7 @@ pub struct AppModel {
     /// Each tag view's last result, by (scope, keyword): shown the moment
     /// the view opens, while a fresh read of the index runs off the main
     /// thread and replaces it only if it differs.
-    tag_view_cache: HashMap<(Option<u32>, Option<String>), Vec<Message>>,
+    tag_view_cache: HashMap<(Option<u32>, Option<String>), Vec<Arc<Message>>>,
     /// A read of the index for the open tag view is in flight; one more
     /// asked for meanwhile runs when it lands.
     tag_view_loading: bool,
@@ -1169,7 +1170,7 @@ pub struct AppModel {
     /// read and cached the way the tag view is.
     smart_folders: Vec<config::SmartFolder>,
     smart_view: Option<String>,
-    smart_view_cache: HashMap<String, Vec<Message>>,
+    smart_view_cache: HashMap<String, Vec<Arc<Message>>>,
     smart_view_loading: bool,
     smart_view_dirty: bool,
     /// The unified Starred view's read of the index (#482) is running, and
@@ -9582,7 +9583,7 @@ impl SimpleComponent for AppModel {
                             .values()
                             .flatten()
                             .find(|m| m.account_id == account_id && m.id == id)
-                            .cloned()
+                            .map(|m| Message::clone(m))
                     });
                 match found {
                     Some(m) => self.forward(m, true, &sender),
@@ -10071,6 +10072,7 @@ impl SimpleComponent for AppModel {
                     let messages = self.apply_pending_seen(account_id, folder_id, messages);
                     let messages = self.apply_pending_answers(account_id, folder_id, messages);
                     let messages = self.apply_pending_tags(account_id, folder_id, messages);
+                    let messages = shared(messages);
                     if open && self.is_unified_target(account_id, folder_id) {
                         self.unified_unfilled.remove(&(account_id, folder_id));
                         self.unified_slices.insert((account_id, folder_id), messages.clone());
@@ -10133,7 +10135,7 @@ impl SimpleComponent for AppModel {
                 let cached = self
                     .message_cache
                     .get(&(origin.account_id, origin.folder_id))
-                    .and_then(|msgs| msgs.iter().find(|m| m.uid == origin.uid).cloned());
+                    .and_then(|msgs| msgs.iter().find(|m| m.uid == origin.uid).map(|m| Message::clone(m)));
                 match cached {
                     Some(m) => self.move_to(m, FolderKind::Trash),
                     None => {
@@ -11497,7 +11499,7 @@ impl SimpleComponent for AppModel {
                             continue;
                         };
                         for m in &mut list {
-                            m.folder_id = id;
+                            Arc::make_mut(m).folder_id = id;
                         }
                         self.message_cache.insert((a, id), list);
                     }
@@ -11849,7 +11851,9 @@ impl SimpleComponent for AppModel {
                 // changed list is worth re-threading and re-emitting: a
                 // rebuild of a large (or merged) list is not free, and it
                 // used to happen several times over per visit.
-                let unchanged = self.message_cache.get(&(account_id, folder_id)) == Some(&messages);
+                let unchanged = self.message_cache.get(&(account_id, folder_id)).is_some_and(|old| {
+                    old.len() == messages.len() && old.iter().zip(&messages).all(|(a, b)| **a == *b)
+                });
                 // What the badge counts when it counts arrivals (#431): the
                 // same new inbox mail as the notification above, whatever
                 // the notification settings, and only what is still in the
@@ -11875,6 +11879,7 @@ impl SimpleComponent for AppModel {
                         crate::notify::withdraw_mail(account_id);
                     }
                 }
+                let messages = shared(messages);
                 self.message_cache
                     .insert((account_id, folder_id), messages.clone());
                 // A draft picker waiting on this folder's list (Send with
@@ -12040,9 +12045,10 @@ impl SimpleComponent for AppModel {
                 };
                 let existing: std::collections::HashSet<u32> =
                     entry.iter().map(|m| m.uid).collect();
-                let fresh: Vec<Message> = messages
+                let fresh: Vec<Arc<Message>> = messages
                     .into_iter()
                     .filter(|m| !existing.contains(&m.uid))
+                    .map(Arc::new)
                     .collect();
                 if fresh.is_empty() {
                     return;
@@ -12987,20 +12993,20 @@ impl AppModel {
 
         out.push_str("Mail index (follows the mailbox size, kept in RAM by design):\n");
         let folders = self.message_cache.len();
-        let index = messages_bytes(self.message_cache.values().flatten());
+        let index = messages_bytes(self.message_cache.values().flatten().map(|m| m.as_ref()));
         out.push_str(&format!(
             "  {} accounts, {} folders indexed: {}\n",
             self.accounts.len(),
             human_count(folders),
             count(index)
         ));
-        let unified = messages_bytes(self.unified_slices.values().flatten());
+        let unified = messages_bytes(self.unified_slices.values().flatten().map(|m| m.as_ref()));
         out.push_str(&format!(
             "  unified slices ({} folders): {}\n",
             human_count(self.unified_slices.len()),
             count(unified)
         ));
-        let tags = messages_bytes(self.tag_view_cache.values().flatten());
+        let tags = messages_bytes(self.tag_view_cache.values().flatten().map(|m| m.as_ref()));
         out.push_str(&format!(
             "  tag views ({}): {}\n",
             human_count(self.tag_view_cache.len()),
@@ -13844,7 +13850,7 @@ impl AppModel {
         self.sidebars_emit(SidebarInput::SetOutboxCount(items.len() as u32));
         if self.showing_outbox {
             self.message_list.emit(MessageListInput::SetMessages {
-                messages: items.iter().map(|i| i.as_message()).collect(),
+                messages: items.iter().map(|i| Arc::new(i.as_message())).collect(),
             });
         }
     }
@@ -14007,9 +14013,11 @@ impl AppModel {
             .into_iter()
             .flatten()
         {
-            for c in msgs.iter_mut().filter(|c| same(c)) {
-                mark(c);
-                id = Some(c.id);
+            for c in msgs.iter_mut() {
+                if same(c) {
+                    mark(Arc::make_mut(c));
+                    id = Some(c.id);
+                }
             }
         }
         self.current_thread.iter_mut().filter(|c| same(c)).for_each(mark);
@@ -14316,7 +14324,7 @@ impl AppModel {
             }
             crate::models::localize_special_folder_names(&mut folders);
             if let Some(inbox) = folders.iter().find(|f| f.kind == FolderKind::Inbox) {
-                let messages = cache.load_messages(account_id, &inbox.path, inbox.id);
+                let messages = shared(cache.load_messages(account_id, &inbox.path, inbox.id));
                 if !messages.is_empty() {
                     self.message_cache.insert((account_id, inbox.id), messages.clone());
                     self.unified_slices.insert((account_id, inbox.id), messages);
@@ -14333,7 +14341,7 @@ impl AppModel {
                     })
             });
             for f in counted {
-                let messages = cache.load_messages(account_id, &f.path, f.id);
+                let messages = shared(cache.load_messages(account_id, &f.path, f.id));
                 if !messages.is_empty() {
                     self.message_cache.insert((account_id, f.id), messages);
                 }
@@ -14881,6 +14889,7 @@ impl AppModel {
             if m.unread {
                 *self.folder_unread.entry((account_id, folder_id)).or_default() += 1;
             }
+            let m = Arc::new(m);
             if self.is_unified_target(account_id, folder_id) {
                 self.unified_slices.entry((account_id, folder_id)).or_default().push(m.clone());
             }
@@ -15183,20 +15192,21 @@ impl AppModel {
 
     /// `shown_copy`, held to one folder.
     fn shown_copy_in(&self, account_id: u32, folder_id: u32, id: u32) -> Option<Message> {
-        let same = |m: &&Message| m.account_id == account_id && m.folder_id == folder_id && m.id == id;
+        let same = |m: &Message| m.account_id == account_id && m.folder_id == folder_id && m.id == id;
         self.current
             .iter()
             .chain(self.current_thread.iter())
-            .find(same)
+            .find(|m| same(m))
+            .cloned()
             .or_else(|| {
                 self.message_cache
                     .get(&(account_id, folder_id))
                     .into_iter()
                     .chain(self.unified_slices.get(&(account_id, folder_id)))
                     .flatten()
-                    .find(same)
+                    .find(|m| same(m))
+                    .map(|m| Message::clone(m))
             })
-            .cloned()
     }
 
     /// The freshest copy of a message the window is showing: the open one,
@@ -15948,7 +15958,7 @@ impl AppModel {
                     .into_iter()
                     .flat_map(|msgs| msgs.iter())
                     .filter(|m| m.unread)
-                    .map(move |m| (a, m))
+                    .map(move |m| (a, m.as_ref()))
             })
             .collect();
         unread.sort_by(|x, y| y.1.timestamp.cmp(&x.1.timestamp));
@@ -16635,7 +16645,7 @@ impl AppModel {
         let Some((account_id, folder_id, uid)) = key else { return };
         if let Some(msgs) = self.message_cache.get_mut(&(account_id, folder_id)) {
             for m in msgs.iter_mut().filter(|m| m.uid == uid) {
-                m.has_attachment = has;
+                Arc::make_mut(m).has_attachment = has;
             }
         }
         self.message_list
@@ -16957,7 +16967,7 @@ impl AppModel {
                     let newest = self.apply_pending_seen(*account_id, *folder_id, newest);
                     let newest = self.apply_pending_answers(*account_id, *folder_id, newest);
                     let newest = self.apply_pending_tags(*account_id, *folder_id, newest);
-                    self.unified_slices.insert((*account_id, *folder_id), newest);
+                    self.unified_slices.insert((*account_id, *folder_id), shared(newest));
                     unseen.push((*account_id, *folder_id, path.clone()));
                 }
             }
@@ -17383,7 +17393,7 @@ impl AppModel {
                     let newest = self.apply_pending_seen(account_id, folder_id, newest);
                     let newest = self.apply_pending_answers(account_id, folder_id, newest);
                     let newest = self.apply_pending_tags(account_id, folder_id, newest);
-                    self.message_list.emit(MessageListInput::SetMessages { messages: newest });
+                    self.message_list.emit(MessageListInput::SetMessages { messages: shared(newest) });
                 }
             }
         }
@@ -17938,12 +17948,13 @@ impl AppModel {
 
     /// The cross-folder search pool: the folders opened this run as they
     /// are now, and `from_disk` for the rest.
-    fn search_pool(&self, from_disk: Vec<Vec<Message>>) -> Vec<Message> {
+    fn search_pool(&self, from_disk: Vec<Vec<Message>>) -> Vec<Arc<Message>> {
         let kinds: HashMap<(u32, u32), FolderKind> = self
             .folders
             .iter()
             .flat_map(|(aid, fs)| fs.iter().map(move |f| ((*aid, f.id), f.kind)))
             .collect();
+        let from_disk: Vec<Vec<Arc<Message>>> = from_disk.into_iter().map(shared).collect();
         build_search_pool(self.message_cache.values().chain(from_disk.iter()), |m| {
             pool_rank(kinds.get(&(m.account_id, m.folder_id)).copied())
         })
@@ -18976,14 +18987,15 @@ impl AppModel {
         for (account_id, folder) in self.templates_folders() {
             let list = match self.message_cache.get(&(account_id, folder.id)) {
                 Some(l) => l.clone(),
-                None => self
-                    .cache
-                    .as_ref()
-                    .map(|c| c.load_messages(account_id, &folder.path, folder.id))
-                    .unwrap_or_default(),
+                None => shared(
+                    self.cache
+                        .as_ref()
+                        .map(|c| c.load_messages(account_id, &folder.path, folder.id))
+                        .unwrap_or_default(),
+                ),
             };
             let name = self.account_name(account_id);
-            templates.extend(list.into_iter().map(|m| (m, name.clone())));
+            templates.extend(list.into_iter().map(|m| (Message::clone(&m), name.clone())));
         }
         templates.sort_by_key(|(m, _)| m.subject.to_lowercase());
         let s = sender.clone();
@@ -19056,14 +19068,15 @@ impl AppModel {
         for (account_id, drafts) in self.drafts_folders() {
             let list = match self.message_cache.get(&(account_id, drafts.id)) {
                 Some(l) => l.clone(),
-                None => self
-                    .cache
-                    .as_ref()
-                    .map(|c| c.load_messages(account_id, &drafts.path, drafts.id))
-                    .unwrap_or_default(),
+                None => shared(
+                    self.cache
+                        .as_ref()
+                        .map(|c| c.load_messages(account_id, &drafts.path, drafts.id))
+                        .unwrap_or_default(),
+                ),
             };
             let name = self.account_name(account_id);
-            out.extend(list.into_iter().map(|m| (m, name.clone())));
+            out.extend(list.into_iter().map(|m| (Message::clone(&m), name.clone())));
         }
         out.sort_by_key(|(m, _)| std::cmp::Reverse(m.timestamp));
         out
@@ -19096,16 +19109,17 @@ impl AppModel {
                 }
                 let list = match self.message_cache.get(&(account_id, f.id)) {
                     Some(l) => l.clone(),
-                    None if f.kind == FolderKind::Inbox => self
-                        .cache
-                        .as_ref()
-                        .map(|c| c.load_messages(account_id, &f.path, f.id))
-                        .unwrap_or_default(),
+                    None if f.kind == FolderKind::Inbox => shared(
+                        self.cache
+                            .as_ref()
+                            .map(|c| c.load_messages(account_id, &f.path, f.id))
+                            .unwrap_or_default(),
+                    ),
                     None => Vec::new(),
                 };
                 for m in list {
                     if seen.insert((m.account_id, m.id)) {
-                        rest.push((m, name.clone()));
+                        rest.push((Message::clone(&m), name.clone()));
                     }
                 }
             }
@@ -20950,7 +20964,7 @@ impl AppModel {
         for ((aid, _), msgs) in self.message_cache.iter() {
             if *aid == account_id {
                 if let Some(m) = msgs.iter().find(|m| m.id == id) {
-                    return Some(m.clone());
+                    return Some(Message::clone(m));
                 }
             }
         }
@@ -20959,7 +20973,7 @@ impl AppModel {
             .filter(|((a, _), _)| *a == account_id)
             .flat_map(|(_, msgs)| msgs.iter())
             .find(|m| m.id == id)
-            .cloned()
+            .map(|m| Message::clone(m))
     }
 
     /// Explain how to set up the system keyring (Secret Service) so passwords
@@ -21291,14 +21305,15 @@ impl AppModel {
             return;
         };
         // Optimistic in-memory update so the UI reacts instantly.
-        if let Some(msgs) = self.message_cache.get_mut(&(account_id, folder_id)) {
-            for m in msgs {
-                m.unread = false;
-            }
-        }
-        if let Some(msgs) = self.unified_slices.get_mut(&(account_id, folder_id)) {
-            for m in msgs {
-                m.unread = false;
+        for msgs in [
+            self.message_cache.get_mut(&(account_id, folder_id)),
+            self.unified_slices.get_mut(&(account_id, folder_id)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for m in msgs.iter_mut().filter(|m| m.unread) {
+                Arc::make_mut(m).unread = false;
             }
         }
         self.folder_unread.insert((account_id, folder_id), 0);
@@ -21356,6 +21371,7 @@ impl AppModel {
             .message_cache
             .values()
             .flatten()
+            .map(|m| m.as_ref())
             .filter(|m| !(m.message_id.is_empty() && m.references.is_empty()))
             .collect();
         // The newest few, picked without sorting the lot: across every
@@ -21456,11 +21472,11 @@ impl AppModel {
                 continue;
             }
             let content = || targets.iter().filter_map(|k| self.message_cache.get(k)).flatten();
-            let fp = content_fp(content());
+            let fp = content_fp(content().map(|m| m.as_ref()));
             if self.message_list.model().has_view(key, fp) {
                 continue;
             }
-            let mut messages: Vec<Message> = content().cloned().collect();
+            let mut messages: Vec<Arc<Message>> = content().cloned().collect();
             messages.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             tracing::debug!("prebuild: {view:?}, {} messages", messages.len());
             self.message_list.emit(MessageListInput::Prebuild { key, fp, messages });
@@ -21536,12 +21552,12 @@ impl AppModel {
     /// for tens of thousands of messages, against a merge and a regrouping
     /// many times that.
     fn unified_fp(&self) -> u64 {
-        content_fp(self.unified_content())
+        content_fp(self.unified_content().map(|m| m.as_ref()))
     }
 
     /// Every message of the open unified view: its slices, and for a folder
     /// not copied yet, the folder's cache.
-    fn unified_content(&self) -> impl Iterator<Item = &Message> {
+    fn unified_content(&self) -> impl Iterator<Item = &Arc<Message>> {
         let filled = self
             .unified_slices
             .iter()
@@ -21578,7 +21594,7 @@ impl AppModel {
         self.list_fp.set(Some(fp));
         self.message_list.emit(MessageListInput::SetViewFp(fp));
         self.unified_emitted_at.set(t);
-        let mut merged: Vec<Message> = self.unified_content().cloned().collect();
+        let mut merged: Vec<Arc<Message>> = self.unified_content().cloned().collect();
         merged.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         tracing::debug!("unified: merged {} messages in {:?}", merged.len(), t.elapsed());
         self.message_list.emit(MessageListInput::SetMessages { messages: merged });
@@ -21785,14 +21801,14 @@ impl AppModel {
 
     /// A smart folder from its rows: newest first, Gmail's per-label copies
     /// of one message as one row, the inbox copy where there is one.
-    fn assemble_smart_view(&self, folder: &config::SmartFolder, rows: Vec<(u32, String, Message)>) -> Vec<Message> {
-        let mut out: Vec<Message> = Vec::new();
+    fn assemble_smart_view(&self, folder: &config::SmartFolder, rows: Vec<(u32, String, Message)>) -> Vec<Arc<Message>> {
+        let mut out: Vec<Arc<Message>> = Vec::new();
         for (account_id, path, mut m) in rows {
             let Some(f) = self.folders.get(&account_id).and_then(|fs| fs.iter().find(|f| f.path == path)) else {
                 continue;
             };
             m.folder_id = f.id;
-            out.push(m);
+            out.push(Arc::new(m));
         }
         if out.is_empty() && demo_mode() && self.config.is_empty() {
             let ctx = self.smart_context(folder);
@@ -21916,11 +21932,11 @@ impl AppModel {
         &self,
         key: &(Option<u32>, Option<String>),
         rows: Vec<(u32, String, Message)>,
-    ) -> Vec<Message> {
+    ) -> Vec<Arc<Message>> {
         let (scope, kw) = key;
         let in_scope = |account_id: u32| self.in_tag_scope(*scope, account_id);
         let keywords = self.tag_view_keywords(kw);
-        let mut out: Vec<Message> = Vec::new();
+        let mut out: Vec<Arc<Message>> = Vec::new();
         let mut seen_rows: std::collections::HashSet<(u32, u32, u32)> =
             std::collections::HashSet::new();
         for (account_id, path, mut m) in rows {
@@ -21932,7 +21948,7 @@ impl AppModel {
             m.folder_id = f.id;
             // A message with several tags answers several keywords.
             if seen_rows.insert((m.account_id, m.folder_id, m.uid)) {
-                out.push(m);
+                out.push(Arc::new(m));
             }
         }
         // The demo's mail never reaches the database, so its tag view reads
@@ -22074,11 +22090,15 @@ impl AppModel {
             c.keywords = keywords.clone();
             c.labels = labels.clone();
         };
-        if let Some(msgs) = self.message_cache.get_mut(&(aid, fid)) {
-            msgs.iter_mut().filter(|c| same(c)).for_each(patch);
-        }
-        if let Some(msgs) = self.unified_slices.get_mut(&(aid, fid)) {
-            msgs.iter_mut().filter(|c| same(c)).for_each(patch);
+        for msgs in [self.message_cache.get_mut(&(aid, fid)), self.unified_slices.get_mut(&(aid, fid))]
+            .into_iter()
+            .flatten()
+        {
+            for c in msgs.iter_mut() {
+                if same(c) {
+                    patch(Arc::make_mut(c));
+                }
+            }
         }
         self.current_thread.iter_mut().filter(|c| same(c)).for_each(patch);
         if let Some(cur) = self.current.as_mut().filter(|c| same(c)) {
@@ -23194,7 +23214,7 @@ impl AppModel {
             .chain(self.unified_slices.get(&key))
             .flatten()
             .find(|x| x.message_id == m.message_id)
-            .cloned()
+            .map(|x| Message::clone(x))
     }
 
     /// Optimistic local cleanup when a message leaves the current folder: close its
@@ -24632,12 +24652,12 @@ impl AppModel {
         for m in found {
             slices.entry((m.account_id, m.folder_id)).or_default().push(m);
         }
-        let mut fresh: HashMap<(u32, u32), Vec<Message>> = HashMap::new();
+        let mut fresh: HashMap<(u32, u32), Vec<Arc<Message>>> = HashMap::new();
         for ((account_id, folder_id), messages) in slices {
             let messages = self.apply_pending_seen(account_id, folder_id, messages);
             let messages = self.apply_pending_answers(account_id, folder_id, messages);
             let messages = self.apply_pending_tags(account_id, folder_id, messages);
-            fresh.insert((account_id, folder_id), messages);
+            fresh.insert((account_id, folder_id), shared(messages));
         }
         let held = self.unified_slices.iter().filter(|((a, _), _)| flagged.contains(a));
         let same = held.clone().count() == fresh.len() && held.into_iter().all(|(k, v)| fresh.get(k) == Some(v));
@@ -24965,7 +24985,7 @@ impl AppModel {
         for cache in [&mut self.message_cache, &mut self.unified_slices] {
             if let Some(msgs) = cache.get_mut(&(account_id, folder_id)) {
                 if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
-                    m.unread = unread;
+                    Arc::make_mut(m).unread = unread;
                 }
             }
         }
@@ -25984,6 +26004,14 @@ fn view_key_of(view: UnifiedView, account: Option<u32>) -> u64 {
 /// What a list holds, as one number: every message's place, state and
 /// tags, whatever order they come in. A few milliseconds for tens of
 /// thousands of messages, against a merge and a regrouping many times that.
+/// One shared copy of each message for the caches, the unified view and the
+/// list to hand between them. A message is copied once, when it arrives, and
+/// every hand-off after that is a pointer: merging the unified view used to
+/// copy every message it held, and each copy is fifteen allocations.
+fn shared(messages: Vec<Message>) -> Vec<Arc<Message>> {
+    messages.into_iter().map(Arc::new).collect()
+}
+
 fn content_fp<'a>(msgs: impl Iterator<Item = &'a Message>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut sum = 0u64;
@@ -27839,8 +27867,11 @@ fn kind_label(kind: FolderKind) -> String {
 /// Gmail files one message under every label it carries, so an archived mail
 /// sits in All Mail and its labels, and an inbox one in INBOX and All Mail
 /// too (#472). Each mail is kept once, from the folder `rank` puts first.
-fn build_search_pool<'a>(lists: impl IntoIterator<Item = &'a Vec<Message>>, rank: impl Fn(&Message) -> u8) -> Vec<Message> {
-    let mut out: Vec<Message> = Vec::new();
+fn build_search_pool<'a>(
+    lists: impl IntoIterator<Item = &'a Vec<Arc<Message>>>,
+    rank: impl Fn(&Message) -> u8,
+) -> Vec<Arc<Message>> {
+    let mut out: Vec<Arc<Message>> = Vec::new();
     let mut copies: HashMap<(u32, &str), Vec<usize>> = HashMap::new();
     for m in lists.into_iter().flatten() {
         if m.message_id.is_empty() {
@@ -27974,7 +28005,7 @@ fn batch_bodies_by_folder(to_load: Vec<MissingBody>) -> Vec<BodyBatch> {
 /// lookup fails on exactly that path — so a delete could throw the selection to
 /// the top of the folder and scroll the list with it (#19).
 fn next_after_vanish(
-    previous: Option<&Vec<Message>>,
+    previous: Option<&Vec<Arc<Message>>>,
     messages: &[Message],
     cur_uid: u32,
 ) -> Option<(u32, u32)> {
@@ -28624,7 +28655,7 @@ mod tests {
     #[test]
     fn a_vanished_message_never_throws_you_to_the_top() {
         let m = |uid| msg(1, 1, uid);
-        let previous = vec![m(10), m(9), m(8), m(7)];
+        let previous = shared(vec![m(10), m(9), m(8), m(7)]);
         let after = vec![m(10), m(9), m(7)];
         // The message that vanished sat third; whatever is third now takes over.
         assert_eq!(next_after_vanish(Some(&previous), &after, 8), Some((1, 7)));
@@ -28930,10 +28961,10 @@ mod tests {
 
     #[test]
     fn search_pool_spans_every_folder_and_account() {
-        let mut cache: HashMap<(u32, u32), Vec<Message>> = HashMap::new();
-        cache.insert((1, 10), vec![msg(1, 10, 1), msg(1, 10, 2)]); // acct 1, inbox
-        cache.insert((1, 11), vec![msg(1, 11, 3)]); // acct 1, archive
-        cache.insert((2, 20), vec![msg(2, 20, 4), msg(2, 20, 5)]); // acct 2, inbox
+        let mut cache: HashMap<(u32, u32), Vec<Arc<Message>>> = HashMap::new();
+        cache.insert((1, 10), shared(vec![msg(1, 10, 1), msg(1, 10, 2)])); // acct 1, inbox
+        cache.insert((1, 11), shared(vec![msg(1, 11, 3)])); // acct 1, archive
+        cache.insert((2, 20), shared(vec![msg(2, 20, 4), msg(2, 20, 5)])); // acct 2, inbox
 
         let pool = build_search_pool(cache.values(), |_| 0);
         assert_eq!(pool.len(), 5, "pool must include every folder's messages");
@@ -28945,7 +28976,7 @@ mod tests {
 
     #[test]
     fn search_pool_is_empty_when_nothing_indexed() {
-        assert!(build_search_pool(HashMap::<(u32, u32), Vec<Message>>::new().values(), |_| 0).is_empty());
+        assert!(build_search_pool(HashMap::<(u32, u32), Vec<Arc<Message>>>::new().values(), |_| 0).is_empty());
     }
 
     /// Gmail's label copies of one mail are one result, from the folder that
@@ -28960,9 +28991,9 @@ mod tests {
             m
         };
         // INBOX = 1, All Mail = 2, a label = 3.
-        let inbox = vec![copy(1, 10, "in@x")];
-        let all_mail = vec![copy(2, 20, "in@x"), copy(2, 21, "archived@x"), copy(2, 22, "only@x")];
-        let label = vec![copy(3, 30, "archived@x")];
+        let inbox = shared(vec![copy(1, 10, "in@x")]);
+        let all_mail = shared(vec![copy(2, 20, "in@x"), copy(2, 21, "archived@x"), copy(2, 22, "only@x")]);
+        let label = shared(vec![copy(3, 30, "archived@x")]);
         let rank = |m: &Message| match m.folder_id {
             1 => pool_rank(Some(FolderKind::Inbox)),
             2 => pool_rank(Some(FolderKind::Archive)),
@@ -28976,7 +29007,7 @@ mod tests {
         // The same Message-ID from someone else is another mail.
         let mut other = copy(3, 31, "only@x");
         other.from_addr = "spam@x".into();
-        assert_eq!(build_search_pool([&all_mail, &vec![other]], rank).len(), 4);
+        assert_eq!(build_search_pool([&all_mail, &shared(vec![other])], rank).len(), 4);
     }
 
     /// The credits metafiles are read at build time and shown in About, so a

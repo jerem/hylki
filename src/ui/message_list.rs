@@ -2,6 +2,7 @@
 //! with a search field and live filtering.
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -304,7 +305,7 @@ fn unasked_threads(
 /// `THREAD_MEMBER_LIMIT`.
 /// What working out conversations reads of each message, to take to a
 /// thread.
-fn thread_inputs(source: &[Rc<Message>]) -> Vec<ThreadInput> {
+fn thread_inputs(source: &[Arc<Message>]) -> Vec<ThreadInput> {
     source
         .iter()
         .map(|m| ThreadInput {
@@ -331,15 +332,15 @@ struct ViewSnapshot {
     key: u64,
     fp: u64,
     sig: u64,
-    all: Vec<Rc<Message>>,
+    all: Vec<Arc<Message>>,
     threads: Option<std::rc::Rc<SourceThreads>>,
     rows: Vec<Rc<RowData>>,
-    shown: Vec<Rc<Message>>,
+    shown: Vec<Arc<Message>>,
     tail: Vec<Rc<RowData>>,
-    groups: std::collections::HashMap<(u32, String), Vec<Rc<Message>>>,
+    groups: std::collections::HashMap<(u32, String), Vec<Arc<Message>>>,
     msg_thread: std::collections::HashMap<(u32, u32), (u32, String)>,
     thread_members: std::collections::HashMap<(u32, String), Vec<(u32, u32)>>,
-    nested: std::collections::HashMap<(u32, u32), Rc<Message>>,
+    nested: std::collections::HashMap<(u32, u32), Arc<Message>>,
     listed_folders: std::collections::HashSet<(u32, u32)>,
     total_matches: usize,
     thread_drag: crate::ui::message_row::ThreadDragKeys,
@@ -383,7 +384,7 @@ impl ThreadFields for Message {
     fn references(&self) -> &str { &self.references }
 }
 
-impl ThreadFields for Rc<Message> {
+impl ThreadFields for Arc<Message> {
     fn account_id(&self) -> u32 { self.as_ref().account_id }
     fn folder_id(&self) -> u32 { self.as_ref().folder_id }
     fn id(&self) -> u32 { self.as_ref().id }
@@ -612,7 +613,7 @@ pub struct MessageList {
     /// A view being built ahead (`Prebuild`) while its conversations are
     /// worked out off the main thread: its number, key, fingerprint and
     /// messages.
-    prebuild: Option<(u64, u64, u64, Vec<Rc<Message>>)>,
+    prebuild: Option<(u64, u64, u64, Vec<Arc<Message>>)>,
     prebuild_gen: u64,
     /// Another view was opened: its first rebuild waits for a frame, and
     /// fills the rows for the new look in passing (#401).
@@ -631,11 +632,11 @@ pub struct MessageList {
     late_select: Option<((u32, u32), std::time::Instant)>,
     /// All messages for the current folder (full searchable index). Shared
     /// with the rows rather than copied: a large folder is listed whole.
-    all: Vec<Rc<Message>>,
+    all: Vec<Arc<Message>>,
     /// Every folder's messages (all accounts), supplied by the app while a search
     /// is active, so `AllFolders` scope can filter across the whole mailbox. Empty
     /// when not searching.
-    search_pool: Vec<Rc<Message>>,
+    search_pool: Vec<Arc<Message>>,
     /// The pool's folders, by `(account_id, folder_id)`.
     pool_folders: Rc<std::collections::HashMap<(u32, u32), PoolFolder>>,
     /// Which messages the search field filters over.
@@ -652,7 +653,7 @@ pub struct MessageList {
     /// The search toolbar never hides (#446): closing only clears it.
     search_pinned: bool,
     /// The rows, in order: what the model shows, one message each.
-    shown: Vec<Rc<Message>>,
+    shown: Vec<Arc<Message>>,
     /// Total messages matching the current filter.
     total_matches: usize,
     query: String,
@@ -711,7 +712,7 @@ pub struct MessageList {
     /// Each conversation the last rebuild listed, with the folder's own
     /// members: what the app needs to look its real size up when a row
     /// showing it comes on screen.
-    groups: std::collections::HashMap<(u32, String), Vec<Rc<Message>>>,
+    groups: std::collections::HashMap<(u32, String), Vec<Arc<Message>>>,
     /// The folders the last rebuild listed: a conversation's members in them
     /// are rows of their own, so only the rest are nested (#309).
     listed_folders: std::collections::HashSet<(u32, u32)>,
@@ -778,7 +779,7 @@ pub struct MessageList {
     /// conversation opens out into without being part of this folder (#309).
     /// Whole-conversation actions look members up in the folder's own index,
     /// so they never reach these.
-    nested: std::collections::HashMap<(u32, u32), Rc<Message>>,
+    nested: std::collections::HashMap<(u32, u32), Arc<Message>>,
     /// Whether the folder's background index is fully loaded. When false, more
     /// rows may still stream in, so reaching the bottom shows a spinner.
     index_complete: bool,
@@ -1264,7 +1265,7 @@ pub enum MessageListInput {
         filters: QuickFilters,
         contacts: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     },
-    SetMessages { messages: Vec<Message> },
+    SetMessages { messages: Vec<Arc<Message>> },
     /// The view now on show (`None` for any other), and its content's
     /// fingerprint. With `restore`, the list shows the view as kept when it
     /// was last left (the app checked with `has_view`) and no messages
@@ -1275,12 +1276,12 @@ pub enum MessageListInput {
     /// Build a view that is not on show and keep it, so its first visit
     /// is shown as kept: the unified rows, once a start has read their
     /// folders.
-    Prebuild { key: u64, fp: u64, messages: Vec<Message> },
+    Prebuild { key: u64, fp: u64, messages: Vec<Arc<Message>> },
     /// The conversations of the view being built ahead.
     PrebuildThreads { gen: u64, threads: Box<SourceThreads> },
     /// Merge more indexed messages into the current list (background backfill),
     /// preserving the current search query and view.
-    AppendMessages { messages: Vec<Message> },
+    AppendMessages { messages: Vec<Arc<Message>> },
     SetLoading,
     SetThreading(bool),
     /// Whether conversation rows may expand into their members in the list
@@ -1404,7 +1405,7 @@ pub enum MessageListInput {
     SetScope(SearchScope),
     /// Replace the cross-folder search pool (all folders, all accounts). Sent by
     /// the app when a search begins; cleared to empty when it ends.
-    SetSearchPool(Vec<Message>, std::collections::HashMap<(u32, u32), PoolFolder>),
+    SetSearchPool(Vec<Arc<Message>>, std::collections::HashMap<(u32, u32), PoolFolder>),
     /// The reader's selection: mirror whichever of these the list has rows for,
     /// so everything that acts on the list's selection acts on the messages the
     /// user pointed at. The reader is already showing them, so this must not
@@ -2113,7 +2114,7 @@ impl SimpleComponent for MessageList {
                 if self.view_key == Some(key) || self.has_view(key, fp) {
                     return;
                 }
-                let all: Vec<Rc<Message>> = messages.into_iter().map(Rc::new).collect();
+                let all = messages;
                 self.prebuild_gen += 1;
                 let gen = self.prebuild_gen;
                 if !self.threading {
@@ -2142,7 +2143,7 @@ impl SimpleComponent for MessageList {
                 self.pending_restore = None;
                 let t = std::time::Instant::now();
                 let n = messages.len();
-                self.all = messages.into_iter().map(Rc::new).collect();
+                self.all = messages;
                 self.drop_threads();
                 self.loaded = true;
                 // Keep any active search query: this also fires for a background
@@ -2160,7 +2161,7 @@ impl SimpleComponent for MessageList {
                 let before = self.all.len();
                 for m in messages {
                     if !existing.contains(&(m.account_id, m.uid)) {
-                        self.all.push(Rc::new(m));
+                        self.all.push(m);
                     }
                 }
                 // The list holds the whole folder, so what arrives joins it.
@@ -2573,7 +2574,7 @@ impl SimpleComponent for MessageList {
                 }
             }
             MessageListInput::SetSearchPool(pool, folders) => {
-                self.search_pool = pool.into_iter().map(Rc::new).collect();
+                self.search_pool = pool;
                 self.pool_folders = Rc::new(folders);
                 self.drop_threads();
                 self.sync_look();
@@ -4297,10 +4298,10 @@ impl MessageList {
     /// Change a message wherever the list holds it — the index, the search
     /// pool and its row — and refresh the row if it is on screen.
     fn update_message(&mut self, is: impl Fn(&Message) -> bool, change: impl Fn(&mut Message)) {
-        let mut changed: Option<Rc<Message>> = None;
+        let mut changed: Option<Arc<Message>> = None;
         for list in [&mut self.all, &mut self.search_pool] {
             if let Some(m) = list.iter_mut().find(|m| is(m)) {
-                change(Rc::make_mut(m));
+                change(Arc::make_mut(m));
                 changed.get_or_insert_with(|| m.clone());
             }
         }
@@ -4311,7 +4312,7 @@ impl MessageList {
                 _ => {
                     let mut m = Message::clone(&self.shown[idx]);
                     change(&mut m);
-                    Rc::new(m)
+                    Arc::new(m)
                 }
             };
             self.shown[idx] = m.clone();
@@ -4324,7 +4325,7 @@ impl MessageList {
                 None => {
                     let mut m = Message::clone(&data.msg);
                     change(&mut m);
-                    Rc::new(m)
+                    Arc::new(m)
                 }
             };
             *row = Rc::new(data);
@@ -4383,7 +4384,7 @@ impl MessageList {
         if self.shared.model.row(idx).is_none_or(|r| r.meta.key.is_none()) {
             return;
         }
-        let now = |m: &Rc<Message>| -> Rc<Message> {
+        let now = |m: &Arc<Message>| -> Arc<Message> {
             let s = thread_slot(m);
             self.all.iter().find(|a| thread_slot(a) == s).cloned().unwrap_or_else(|| m.clone())
         };
@@ -4446,7 +4447,7 @@ impl MessageList {
             return;
         };
         // `members` is already oldest-first (see `rebuild`).
-        let children: Vec<Rc<Message>> = {
+        let children: Vec<Arc<Message>> = {
             let source = self.active_source();
             members
                 .iter()
@@ -4506,7 +4507,7 @@ impl MessageList {
     /// The message set the search filters over: the cross-folder pool while an
     /// `AllFolders` search is active (and the pool has arrived), otherwise the
     /// current folder's own index.
-    fn active_source(&self) -> &[Rc<Message>] {
+    fn active_source(&self) -> &[Arc<Message>] {
         if self.searching_pool() {
             &self.search_pool
         } else {
@@ -4664,7 +4665,7 @@ impl MessageList {
 
     /// Build the view `key` from `all` and keep it, leaving the view on show
     /// as it is: its state steps aside for the build and comes back.
-    fn prebuild_view(&mut self, key: u64, fp: u64, all: Vec<Rc<Message>>, threads: Option<Rc<SourceThreads>>) {
+    fn prebuild_view(&mut self, key: u64, fp: u64, all: Vec<Arc<Message>>, threads: Option<Rc<SourceThreads>>) {
         // A search on show would filter the build; the visit builds it then.
         if !self.query.is_empty() {
             return;
@@ -4825,7 +4826,7 @@ impl MessageList {
 
     /// Who took part in a conversation (#334), for its Correspondents
     /// column: `msgs` and the replies filed in other folders.
-    fn people_of(&self, key: &(u32, String), msgs: &[Rc<Message>]) -> String {
+    fn people_of(&self, key: &(u32, String), msgs: &[Arc<Message>]) -> String {
         let summary = self.threading.then(|| self.thread_summaries.get(key)).flatten();
         let mut all: Vec<&Message> = msgs.iter().map(|m| &**m).collect();
         all.extend(summary.iter().flat_map(|s| s.members.iter()));
@@ -4841,10 +4842,10 @@ impl MessageList {
     fn describe_group(
         &mut self,
         key: &(u32, String),
-        own: &[Rc<Message>],
+        own: &[Arc<Message>],
         passes: &impl Fn(&Message) -> bool,
         full: bool,
-    ) -> (RowMeta, Vec<Rc<Message>>) {
+    ) -> (RowMeta, Vec<Arc<Message>>) {
         let mut msgs = own.to_vec();
         let summary = self.threading.then(|| self.thread_summaries.get(key)).flatten();
         // The parts of the conversation filed elsewhere, which the row opens
@@ -4853,11 +4854,11 @@ impl MessageList {
         // on: off, an Inbox row opened out into nothing but your answers
         // from Sent (#388). Gmail's All Mail copy of them goes too.
         let own = (!self.thread_row_newest).then_some(&self.own_addresses);
-        let extras: Vec<Rc<Message>> = match summary {
+        let extras: Vec<Arc<Message>> = match summary {
             Some(s) if self.thread_expansion => nested_members(&s.members, &msgs, &self.listed_folders, passes)
                 .into_iter()
                 .filter(|m| !own.is_some_and(|own| own.contains(&m.from_addr.to_lowercase())))
-                .map(Rc::new)
+                .map(Arc::new)
                 .collect(),
             _ => Vec::new(),
         };
@@ -5088,7 +5089,7 @@ impl MessageList {
     fn compute_rows(&mut self, offscreen: bool) -> Built {
         let passes = self.filter();
         let source_len = self.active_source().len();
-        let mut matches: Vec<Rc<Message>> = self.active_source().iter().filter(|m| passes(m)).cloned().collect();
+        let mut matches: Vec<Arc<Message>> = self.active_source().iter().filter(|m| passes(m)).cloned().collect();
         if self.searching() {
             tracing::debug!("list: search matched {} of {} messages ({:?})", matches.len(), source_len, self.scope);
         }
@@ -5111,7 +5112,7 @@ impl MessageList {
             // Each message's tag names are worked out once, not at every
             // comparison.
             let tags = self.shared.tags.borrow();
-            let mut keyed: Vec<(String, Rc<Message>)> =
+            let mut keyed: Vec<(String, Arc<Message>)> =
                 matches.drain(..).map(|m| (tag_sort_key(&m, &tags), m)).collect();
             keyed.sort_by(|(ka, a), (kb, b)| flip(text_key_cmp(ka, kb).then(b.timestamp.cmp(&a.timestamp))));
             matches = keyed.into_iter().map(|(_, m)| m).collect();
@@ -5146,7 +5147,7 @@ impl MessageList {
                 .unwrap_or_else(|| (m.account_id, format!("\u{0}uid{}/{}", m.folder_id, m.uid)))
         };
         let mut order: Vec<(u32, String)> = Vec::new();
-        let mut groups: std::collections::HashMap<(u32, String), Vec<Rc<Message>>> =
+        let mut groups: std::collections::HashMap<(u32, String), Vec<Arc<Message>>> =
             std::collections::HashMap::new();
         for m in matches {
             let key = key_for(&m);
@@ -5184,7 +5185,7 @@ impl MessageList {
         let day_starts = by_date.then(|| crate::datefmt::day_starts(crate::datefmt::now()));
 
         // Flatten back into display order, recording per-row thread metadata.
-        let mut shown: Vec<Rc<Message>> = Vec::new();
+        let mut shown: Vec<Arc<Message>> = Vec::new();
         let mut rows: Vec<Rc<RowData>> = Vec::new();
         let mut thread_drag = crate::ui::message_row::ThreadDragKeys::new();
         // The last rebuild's maps go after the frame: for a large folder,
@@ -5237,7 +5238,7 @@ impl MessageList {
             if expanded {
                 any_expanded = true;
                 let closing = self.collapsing_threads.contains_key(key);
-                let rest: Vec<Rc<Message>> = it.collect();
+                let rest: Vec<Arc<Message>> = it.collect();
                 let n = rest.len();
                 for (j, child) in rest.into_iter().enumerate() {
                     let slot = thread_slot(&child);
@@ -5646,6 +5647,7 @@ mod tests {
     use crate::ui::message_row::{row_edits, swap_wanted, swipe_progress_px, DaySection, RowData, RowEdit, SWIPE_ARM, SWIPE_MAX};
     use crate::models::Message;
     use std::rc::Rc;
+    use std::sync::Arc;
 
     /// Apply `row_edits` to `old` the way the model applies them, then add
     /// the rest of `new`, and return the result alongside the number of rows
@@ -6191,7 +6193,7 @@ mod tests {
     #[test]
     fn sections_are_the_runs_of_one_heading() {
         use crate::ui::message_row::section_starts;
-        let row = |id: u32, section| Rc::new(RowData { msg: Rc::new(msg(id, "", "")), meta: Default::default(), section });
+        let row = |id: u32, section| Rc::new(RowData { msg: Arc::new(msg(id, "", "")), meta: Default::default(), section });
         assert_eq!(section_starts(&[]), vec![0]);
         let plain: Vec<_> = (0..5).map(|i| row(i, DaySection::None)).collect();
         assert_eq!(section_starts(&plain), vec![0]);

@@ -347,6 +347,7 @@ struct ViewSnapshot {
     window: usize,
     /// Its rows stop short of its messages (see [`ROWS_AHEAD`]).
     tail_stale: bool,
+    tail_short: bool,
 }
 
 /// How many views the list keeps as built: the unified rows built ahead
@@ -852,6 +853,10 @@ pub struct MessageList {
     /// for them (see `quiet_append`), so `tail` is short of the list and the
     /// next thing that needs it rebuilds first.
     tail_stale: bool,
+    /// The rows stop at [`ROWS_AHEAD`] past the window with more of the list
+    /// behind them. Unlike `tail_stale` the rows there are good: scrolling
+    /// takes them as it always did, and builds more once they run out.
+    tail_short: bool,
     /// Your contacts' addresses, lower case, while "From Contacts" is on.
     contact_addresses: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     /// The last count string sent to the header bar, to emit only on change.
@@ -2032,6 +2037,7 @@ impl SimpleComponent for MessageList {
             sort: SortOrder::DateNewest,
             quick: QuickFilters::default(),
             tail_stale: false,
+            tail_short: false,
             contact_addresses: None,
             last_count: String::new(),
             threading: true,
@@ -3564,7 +3570,10 @@ impl SimpleComponent for MessageList {
                 // The rows stop a little past the window, so the one asked
                 // for may not be built: build as far down as its own message
                 // sits, which a row never sits further down than.
-                if self.tail_stale {
+                if self.tail_stale
+                    || (self.tail_short
+                        && !self.tail.iter().any(|r| (r.msg.account_id, r.msg.id) == key))
+                {
                     if let Some(at) = self.all.iter().position(|m| (m.account_id, m.id) == key) {
                         self.window = self.window.max(at + 1);
                     }
@@ -4433,10 +4442,11 @@ impl MessageList {
 
     /// Put up to `n` more rows on screen from the tail.
     fn grow_window(&mut self, n: usize) {
-        // Messages joined the list while it was not being built: the rows
-        // past the window are short of them, so they are built now, straight
-        // to the size being asked for.
-        if std::mem::take(&mut self.tail_stale) {
+        // Messages joined the list while it was not being built, or the rows
+        // ran out with more of the list behind them: either way the rows are
+        // built now, straight to the size being asked for.
+        let short_of_rows = self.tail_short && self.tail.len() < n;
+        if std::mem::take(&mut self.tail_stale) || short_of_rows {
             self.window = self.window.max(LIST_WINDOW) + n;
             self.rebuild_rows();
             return;
@@ -4673,6 +4683,7 @@ impl MessageList {
             thread_drag: std::mem::take(&mut *self.shared.thread_drag.borrow_mut()),
             window: self.window,
             tail_stale: self.tail_stale,
+            tail_short: self.tail_short,
         };
         self.views.retain(|v| v.key != key);
         self.views.push_front(snap);
@@ -4743,6 +4754,7 @@ impl MessageList {
         self.shown = snap.shown;
         self.window = snap.window;
         self.tail_stale = snap.tail_stale;
+        self.tail_short = snap.tail_short;
         let stale = self.look_stale.take();
         if !self.shared.model.replace(snap.rows, stale) && stale {
             self.shared.refresh_all();
@@ -4778,6 +4790,7 @@ impl MessageList {
         let selected_ids = std::mem::take(&mut self.selected_ids);
         let selected_id = self.selected_id.take();
         let tail_stale = std::mem::replace(&mut self.tail_stale, false);
+        let tail_short = std::mem::replace(&mut self.tail_short, false);
 
         let built = self.compute_rows(true);
         let snap = ViewSnapshot {
@@ -4798,6 +4811,7 @@ impl MessageList {
             thread_drag: std::mem::replace(&mut *self.shared.thread_drag.borrow_mut(), thread_drag),
             window: std::mem::replace(&mut self.window, window),
             tail_stale: std::mem::replace(&mut self.tail_stale, tail_stale),
+            tail_short: std::mem::replace(&mut self.tail_short, tail_short),
         };
         *self.source_threads.borrow_mut() = source_threads;
         self.selected_ids = selected_ids;
@@ -5442,9 +5456,11 @@ impl MessageList {
         shown.truncate(limit);
         self.window = limit.max(LIST_WINDOW);
         self.shown = shown;
-        // What was not built is built by whatever reaches for it. A view
-        // built ahead carries this into its snapshot, like the rest.
-        self.tail_stale = short;
+        // The rows that were not built are built by whatever reaches for
+        // them. A view built ahead carries this into its snapshot, like the
+        // rest; the rows that were built are good either way.
+        self.tail_short = short;
+        self.tail_stale = false;
         Built { rows, by_date, any_expanded }
     }
 

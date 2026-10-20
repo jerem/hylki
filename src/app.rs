@@ -11754,11 +11754,26 @@ impl SimpleComponent for AppModel {
                 // move. Point it at the row that is really there now: every
                 // action on it addresses a UID, and the check just below would
                 // otherwise read it as a message deleted from under us.
-                let renumbered: HashMap<&str, (u32, u32)> = messages
+                // Only the reader's own messages are looked up, which is one
+                // message and its conversation: indexing the whole folder to
+                // find a handful cost more than the sync it belongs to.
+                let wanted: std::collections::HashSet<&str> = self
+                    .current
                     .iter()
-                    .filter(|m| !m.message_id.is_empty())
-                    .map(|m| (m.message_id.as_str(), (m.uid, m.id)))
+                    .chain(self.current_thread.iter())
+                    .filter(|m| m.account_id == account_id && m.folder_id == folder_id)
+                    .map(|m| m.message_id.as_str())
+                    .filter(|id| !id.is_empty())
                     .collect();
+                let renumbered: HashMap<&str, (u32, u32)> = if wanted.is_empty() {
+                    HashMap::new()
+                } else {
+                    messages
+                        .iter()
+                        .filter(|m| wanted.contains(m.message_id.as_str()))
+                        .map(|m| (m.message_id.as_str(), (m.uid, m.id)))
+                        .collect()
+                };
                 let renumber = |m: &mut Message| {
                     if m.account_id != account_id || m.folder_id != folder_id {
                         return;
@@ -11768,11 +11783,13 @@ impl SimpleComponent for AppModel {
                         m.id = id;
                     }
                 };
-                if let Some(cur) = self.current.as_mut() {
-                    renumber(cur);
-                }
-                for tm in self.current_thread.iter_mut() {
-                    renumber(tm);
+                if !renumbered.is_empty() {
+                    if let Some(cur) = self.current.as_mut() {
+                        renumber(cur);
+                    }
+                    for tm in self.current_thread.iter_mut() {
+                        renumber(tm);
+                    }
                 }
                 // Did this sync remove the message currently open in the reader
                 // (deleted/moved on another device)? Scope the check to the reader's
@@ -26063,6 +26080,15 @@ fn adopt(held: Option<&Vec<Arc<Message>>>, messages: Vec<Message>) -> (Vec<Arc<M
     let Some(held) = held else {
         return (shared(messages), false);
     };
+    // Almost always the folder comes back in the order it was already in, so
+    // it is walked straight through first: that answers the whole question
+    // without indexing anything, and a sync that changed nothing is the one
+    // this runs for most often.
+    if held.len() == messages.len()
+        && held.iter().zip(&messages).all(|(a, b)| a.uid == b.uid && **a == *b)
+    {
+        return (held.to_vec(), true);
+    }
     let by_uid: HashMap<(u32, u32), &Arc<Message>> =
         held.iter().map(|m| ((m.account_id, m.uid), m)).collect();
     let mut same = held.len() == messages.len();

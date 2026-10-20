@@ -1348,6 +1348,9 @@ pub struct AppModel {
     unified_emit_queued: std::cell::Cell<bool>,
     unified_dirty: std::cell::Cell<bool>,
     thread_links_due: std::cell::Cell<bool>,
+    /// The last page of conversations the badges were asked about, so the
+    /// same question is not asked twice (see `request_thread_summaries`).
+    thread_summaries_asked: Option<u64>,
     unified_emitted_at: std::cell::Cell<std::time::Instant>,
     /// The fingerprint of the unified view's content the list has, when it
     /// has the open view's: a merge that would hand it the same is skipped.
@@ -3874,6 +3877,7 @@ impl SimpleComponent for AppModel {
             unified_emit_queued: std::cell::Cell::new(false),
             unified_dirty: std::cell::Cell::new(false),
             thread_links_due: std::cell::Cell::new(false),
+            thread_summaries_asked: None,
             unified_emitted_at: std::cell::Cell::new(std::time::Instant::now()),
             list_fp: std::cell::Cell::new(None),
             unified_unfilled: std::collections::HashSet::new(),
@@ -11938,6 +11942,10 @@ impl SimpleComponent for AppModel {
                     // assembled, so what was stored is no longer necessarily
                     // the conversation.
                     self.forget_threads(account_id);
+                    // And the badges may now count differently, including for
+                    // rows whose own messages did not change: the reply that
+                    // arrived may be in Sent. Ask again for the page on show.
+                    self.thread_summaries_asked = None;
                     // In a unified view, with the next merge, once for a run
                     // of answers; a folder's own list takes them now, in the
                     // same pass as its messages.
@@ -21460,6 +21468,19 @@ impl AppModel {
         if !self.threading || groups.is_empty() {
             return;
         }
+        // The same page, asked again: a rebuild re-draws the rows that were
+        // already there, and answering costs the account's whole index of
+        // reply headers. The answer has not changed either.
+        let asked = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            groups.hash(&mut h);
+            h.finish()
+        };
+        if self.thread_summaries_asked == Some(asked) {
+            return;
+        }
+        self.thread_summaries_asked = Some(asked);
         let mut by_account: HashMap<u32, Vec<(String, Vec<String>)>> = HashMap::new();
         for (account_id, root, ids) in groups {
             by_account.entry(account_id).or_default().push((root, ids));

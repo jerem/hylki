@@ -77,6 +77,13 @@ CREATE INDEX IF NOT EXISTS messages_starred ON messages (account_id, ts) WHERE s
 -- A folder's newest messages, read first so a list shows before the rest of
 -- a large folder is in.
 CREATE INDEX IF NOT EXISTS messages_by_folder_ts ON messages (account_id, folder_path, ts);
+-- The conversation badges ask which messages name one of the ids on the
+-- page, and answering reads every References in the account. Held here as
+-- well, that pass reads this index alone instead of fetching a row of a
+-- table that runs to gigabytes, which for a large Gmail account was seconds
+-- of the cache lane per page drawn.
+CREATE INDEX IF NOT EXISTS messages_refs_scan ON messages (account_id, references_)
+    WHERE references_ <> '';
 CREATE TABLE IF NOT EXISTS local_tags (
     account_id  INTEGER NOT NULL,
     message_id  TEXT    NOT NULL,
@@ -229,11 +236,12 @@ const ACCOUNT_TABLES: [&str; 11] = [
 /// answered on email.a1.net was flagged). Suspicious verdicts stored earlier,
 /// and the bodies served with them, are dropped once so those messages are
 /// checked again when next opened; every other cached body stays.
+/// v23: `messages_refs_scan`, the index the conversation badges read.
 /// v22: nothing stored changes. The upgrade in [`Cache::migrate`] now runs
 /// only when this number differs from the file's, not on every open, so the
 /// bump makes every cache run it once more and pick up the columns added
 /// without one. Raise this with every new `ALTER TABLE` there.
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 
 /// The newest version whose change altered how bodies are *rendered* or how
 /// senders are checked. Opening a database older than this drops `bodies` and

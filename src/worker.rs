@@ -7768,9 +7768,8 @@ async fn load_messages(
     if total == 0 {
         // Folder emptied on the server — drop any cached copies so they don't linger.
         if let Some(c) = cache {
-            for uid in c.cached_uids(account_id, path) {
-                c.delete_message(account_id, path, uid);
-            }
+            let gone: Vec<u32> = c.cached_uids(account_id, path).into_iter().collect();
+            c.delete_messages(account_id, path, &gone);
         }
         return Ok(Vec::new());
     }
@@ -7798,9 +7797,9 @@ async fn load_messages(
         // UID set is a cheap server-side search even for large mailboxes.
         let server: std::collections::HashSet<u32> = search_uids(session, "ALL").await?;
         if let Some(c) = cache {
-            for m in merged.iter().filter(|m| !server.contains(&m.uid)) {
-                c.delete_message(account_id, path, m.uid);
-            }
+            let gone: Vec<u32> =
+                merged.iter().filter(|m| !server.contains(&m.uid)).map(|m| m.uid).collect();
+            c.delete_messages(account_id, path, &gone);
         }
         merged.retain(|m| server.contains(&m.uid));
         reconcile_attachment_flags(cache, account_id, path, &mut merged);
@@ -9084,11 +9083,8 @@ async fn backfill_worklist(
         .map(|c| c.cached_uids(account_id, path))
         .unwrap_or_default();
     if let Some(c) = cache {
-        for uid in cached.iter() {
-            if !server.contains(uid) {
-                c.delete_message(account_id, path, *uid);
-            }
-        }
+        let gone: Vec<u32> = cached.difference(&server).copied().collect();
+        c.delete_messages(account_id, path, &gone);
     }
     let mut remaining: Vec<u32> = server.difference(&cached).copied().collect();
     remaining.sort_unstable_by(|a, b| b.cmp(a)); // newest first

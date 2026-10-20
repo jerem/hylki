@@ -229,7 +229,11 @@ const ACCOUNT_TABLES: [&str; 11] = [
 /// answered on email.a1.net was flagged). Suspicious verdicts stored earlier,
 /// and the bodies served with them, are dropped once so those messages are
 /// checked again when next opened; every other cached body stays.
-const SCHEMA_VERSION: i64 = 21;
+/// v22: nothing stored changes. The upgrade in [`Cache::migrate`] now runs
+/// only when this number differs from the file's, not on every open, so the
+/// bump makes every cache run it once more and pick up the columns added
+/// without one. Raise this with every new `ALTER TABLE` there.
+const SCHEMA_VERSION: i64 = 22;
 
 /// The newest version whose change altered how bodies are *rendered* or how
 /// senders are checked. Opening a database older than this drops `bodies` and
@@ -331,6 +335,30 @@ static MSGID_CASE_PENDING: std::sync::OnceLock<std::sync::Mutex<std::collections
 
 fn msgid_case_pending() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
     MSGID_CASE_PENDING.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Held while one thread upgrades the cache, so threads opening it at the
+/// same moment don't run the same upgrade side by side.
+static MIGRATING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn schema_version(conn: &Connection) -> i64 {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0)
+}
+
+/// Settings SQLite keeps per connection rather than in the file, so every
+/// connection sets them.
+fn tune(conn: &Connection) {
+    // Safe from corruption under WAL. A commit is lost only if the machine
+    // goes down, not just the app, and everything here but the Outbox can
+    // be fetched again (see [`Cache::durably`]). It saves an fsync on every
+    // commit, and the sync workers commit often.
+    let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+    // 16 MiB of page cache instead of the default 2 MiB. Each account opens
+    // a few connections, so this stays modest and the memory map serves
+    // most reads without a copy.
+    let _ = conn.pragma_update(None, "cache_size", -16_384);
+    let _ = conn.pragma_update(None, "mmap_size", 256 * 1024 * 1024);
+    let _ = conn.pragma_update(None, "temp_store", "MEMORY");
 }
 
 /// The most a parse can note before a batch of messages carries it to disk;
@@ -573,6 +601,7 @@ impl Cache {
         ))?;
         let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        tune(&conn);
         Ok(Cache { conn })
     }
 
@@ -596,9 +625,49 @@ impl Cache {
         // `accounts.toml` gets.
         restrict(&db, 0o600);
 
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(0);
+        // Wait for a worker's write instead of failing at once. Everything
+        // below shares this file with the account workers, the upgrade too.
+        conn.busy_timeout(Duration::from_secs(5))?;
+        // Concurrency: multiple account workers share this file.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        tune(&conn);
+        Self::upgrade(&conn)?;
+
+        // SQLite creates the WAL sidecars itself, and only once WAL mode is on —
+        // hence here rather than beside the `Connection::open` above. They hold
+        // the same message data mid-transaction, so they get the same mode. The
+        // 0700 on the directory is what actually keeps other users out; this is
+        // in case the cache is ever moved somewhere less private.
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut side = db.clone().into_os_string();
+            side.push(suffix);
+            restrict(std::path::Path::new(&side), 0o600);
+        }
+
+        Ok(Cache { conn })
+    }
+
+    /// Upgrade the cache when the stored version differs, not on every open.
+    /// `open` is called for single lookups in places, and the cleanups in
+    /// [`Cache::migrate`] scan whole tables while holding the write lock the
+    /// sync workers need. One thread upgrades, and another opening meanwhile
+    /// waits for it and then finds the work done.
+    fn upgrade(conn: &Connection) -> rusqlite::Result<()> {
+        if schema_version(conn) == SCHEMA_VERSION {
+            return Ok(());
+        }
+        let _upgrading = MIGRATING.lock().unwrap_or_else(|p| p.into_inner());
+        let version = schema_version(conn);
+        if version == SCHEMA_VERSION {
+            return Ok(());
+        }
+        Self::migrate(conn, version)
+    }
+
+    /// Bring a cache last opened at `version` up to [`SCHEMA_VERSION`]: drop
+    /// what an older layout or renderer left behind, add the columns added
+    /// since, and clean the rows older builds stored wrongly.
+    fn migrate(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         // Upgrading in place (layout current, message index preserved) rather
         // than wiping and re-syncing the whole mailbox.
         let upgrading_index = (LAYOUT_VERSION..SCHEMA_VERSION).contains(&version);
@@ -703,20 +772,20 @@ impl Cache {
             [crate::models::ENCRYPTED_PREVIEW],
         );
         if upgrading_index {
-            Self::redecode_encoded_subjects(&conn);
+            Self::redecode_encoded_subjects(conn);
         }
         if upgrading_index && version < 20 {
-            Self::clean_quoted_names(&conn);
+            Self::clean_quoted_names(conn);
         }
         if (LAYOUT_VERSION..21).contains(&version) {
-            Self::recheck_suspicious_senders(&conn);
+            Self::recheck_suspicious_senders(conn);
         }
         // `attachment_meta` is the gallery's record of every attachment that
         // *exists*; `attachments` holds the few whose bytes were downloaded.
         // Seed the first from the second so files already in hand keep showing
         // while the scan works back through the archive.
         if version < 14 {
-            Self::seed_attachment_meta(&conn);
+            Self::seed_attachment_meta(conn);
         }
         // Re-queue the messages a batched parse failure wrote off. Messages
         // that really do hold nothing are simply asked about once more and
@@ -743,23 +812,7 @@ impl Cache {
             );
         }
         let _ = conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"));
-
-        // Concurrency: multiple account workers share this file.
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let _ = conn.busy_timeout(Duration::from_secs(5));
-
-        // SQLite creates the WAL sidecars itself, and only once WAL mode is on —
-        // hence here rather than beside the `Connection::open` above. They hold
-        // the same message data mid-transaction, so they get the same mode. The
-        // 0700 on the directory is what actually keeps other users out; this is
-        // in case the cache is ever moved somewhere less private.
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let mut side = db.clone().into_os_string();
-            side.push(suffix);
-            restrict(std::path::Path::new(&side), 0o600);
-        }
-
-        Ok(Cache { conn })
+        Ok(())
     }
 
     /// One-time upgrade fix: earlier builds cached a message's subject verbatim
@@ -1120,18 +1173,16 @@ impl Cache {
                 pending.drain().collect()
             };
             for (lower, exact) in &noted {
-                tx.execute(
-                    "INSERT OR REPLACE INTO msgid_case (lower, exact) VALUES (?1, ?2)",
-                    params![lower, exact],
-                )?;
+                tx.prepare_cached("INSERT OR REPLACE INTO msgid_case (lower, exact) VALUES (?1, ?2)")?
+                    .execute(params![lower, exact])?;
             }
-            for m in messages {
-                // Upsert rather than REPLACE so an empty preview cannot erase one
-                // already stored: the background backfill re-fetches summaries
-                // without asking for a body slice, and every message it touched
-                // lost its preview.
-                tx.execute(
-                    "INSERT INTO messages
+            // Prepared once for the whole batch, not once per row.
+            // Upsert rather than REPLACE so an empty preview cannot erase one
+            // already stored: the background backfill re-fetches summaries
+            // without asking for a body slice, and every message it touched
+            // lost its preview.
+            let mut upsert = tx.prepare_cached(
+                "INSERT INTO messages
                      (account_id, folder_path, uid, from_name, from_addr, subject, date, ts, unread, starred, has_attachment, recipients, cc, message_id, references_, preview, reply_to, keywords, importance, due, gmail_labels, answered, forwarded, bcc)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
                      ON CONFLICT(account_id, folder_path, uid) DO UPDATE SET
@@ -1156,14 +1207,16 @@ impl Cache {
                        answered = excluded.answered,
                        forwarded = excluded.forwarded,
                        bcc = excluded.bcc",
-                    params![
-                        account_id, folder_path, m.uid, m.from_name, m.from_addr, m.subject,
-                        m.date, m.timestamp, m.unread, m.starred, m.has_attachment, m.to, m.cc,
-                        m.message_id, m.references, m.preview, m.reply_to, m.keywords.join(" "),
-                        m.importance.to_i64(), m.due, join_labels(&m.labels), m.answered, m.forwarded, m.bcc
-                    ],
-                )?;
+            )?;
+            for m in messages {
+                upsert.execute(params![
+                    account_id, folder_path, m.uid, m.from_name, m.from_addr, m.subject,
+                    m.date, m.timestamp, m.unread, m.starred, m.has_attachment, m.to, m.cc,
+                    m.message_id, m.references, m.preview, m.reply_to, m.keywords.join(" "),
+                    m.importance.to_i64(), m.due, join_labels(&m.labels), m.answered, m.forwarded, m.bcc
+                ])?;
             }
+            drop(upsert);
             tx.commit()
         };
         if let Err(e) = run() {
@@ -2194,7 +2247,7 @@ impl Cache {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        self.conn
+        self.durably(|| self.conn
             .execute(
                 "INSERT INTO outbox(account_id, from_addr, rcpts, recipients, subject, \
                  preview, raw, sent_path, queued_at, attempts, last_error, send_at) \
@@ -2214,13 +2267,27 @@ impl Cache {
                 ],
             )
             .map_err(|e| tracing::warn!("could not queue the message: {e}"))
-            .ok()?;
+            .ok())?;
         Some(self.conn.last_insert_rowid() as u32)
+    }
+
+    /// Run `write` with its commits synced to disk before it returns. The
+    /// connection otherwise runs with `synchronous=NORMAL` (see [`tune`]),
+    /// which is fine for mail the server still has but not for the Outbox: a
+    /// queued message lives only here, and a sent one left in the queue
+    /// would go out twice.
+    fn durably<T>(&self, write: impl FnOnce() -> T) -> T {
+        let _ = self.conn.pragma_update(None, "synchronous", "FULL");
+        let out = write();
+        let _ = self.conn.pragma_update(None, "synchronous", "NORMAL");
+        out
     }
 
     /// Note the message a queued forward forwards (#454).
     pub fn set_outbox_forwards(&self, id: u32, forwards: &str) {
-        let _ = self.conn.execute("UPDATE outbox SET forwards = ?1 WHERE id = ?2", params![forwards, id]);
+        let _ = self.durably(|| {
+            self.conn.execute("UPDATE outbox SET forwards = ?1 WHERE id = ?2", params![forwards, id])
+        });
     }
 
     /// Everything waiting for this account, oldest first (the order it is sent in).
@@ -2277,7 +2344,7 @@ impl Cache {
 
     /// Drop a queued message — it went out, or the user discarded it.
     pub fn delete_outbox(&self, id: u32) {
-        let _ = self.conn.execute("DELETE FROM outbox WHERE id = ?1", params![id]);
+        let _ = self.durably(|| self.conn.execute("DELETE FROM outbox WHERE id = ?1", params![id]));
     }
 
     /// Record another failed attempt, so the list can say what went wrong.
@@ -2727,22 +2794,31 @@ impl Cache {
     }
 
     pub fn delete_message(&self, account_id: u32, folder_path: &str, uid: u32) {
-        let _ = self.conn.execute(
-            "DELETE FROM messages WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
-            params![account_id, folder_path, uid],
-        );
-        let _ = self.conn.execute(
-            "DELETE FROM bodies WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
-            params![account_id, folder_path, uid],
-        );
-        let _ = self.conn.execute(
-            "DELETE FROM attachments WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
-            params![account_id, folder_path, uid],
-        );
-        let _ = self.conn.execute(
-            "DELETE FROM attachments_checked WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3",
-            params![account_id, folder_path, uid],
-        );
+        self.delete_messages(account_id, folder_path, &[uid]);
+    }
+
+    /// Drop these messages of one folder and everything stored beside them,
+    /// in one transaction: a reconcile that finds thousands gone commits once
+    /// instead of four times per message.
+    pub fn delete_messages(&self, account_id: u32, folder_path: &str, uids: &[u32]) {
+        if uids.is_empty() {
+            return;
+        }
+        let run = || -> rusqlite::Result<()> {
+            let tx = self.conn.unchecked_transaction()?;
+            for table in ["messages", "bodies", "attachments", "attachments_checked"] {
+                let mut stmt = tx.prepare_cached(&format!(
+                    "DELETE FROM {table} WHERE account_id = ?1 AND folder_path = ?2 AND uid = ?3"
+                ))?;
+                for uid in uids {
+                    stmt.execute(params![account_id, folder_path, uid])?;
+                }
+            }
+            tx.commit()
+        };
+        if let Err(e) = run() {
+            tracing::warn!("cache delete_messages failed: {e}");
+        }
     }
 }
 
@@ -3352,6 +3428,64 @@ mod tests {
             params![folder, uid, from, subject, ts],
         ).unwrap();
     }
+    fn preview_of(c: &Cache, uid: u32) -> String {
+        c.conn.query_row("SELECT preview FROM messages WHERE uid = ?1", [uid], |r| r.get(0)).unwrap()
+    }
+
+    /// The upgrade's cleanups run once when the version moves, and an open at
+    /// the current version leaves the rows alone instead of scanning them.
+    #[test]
+    fn the_upgrade_runs_once_per_version() {
+        let c = Cache::in_memory().unwrap();
+        add_msg(&c, "INBOX", 1, "a", "s", 100);
+        c.conn.execute("UPDATE messages SET preview = '--b2=_boundary' WHERE uid = 1", []).unwrap();
+        c.conn.execute_batch("PRAGMA user_version = 21;").unwrap();
+
+        Cache::upgrade(&c.conn).unwrap();
+        assert_eq!(preview_of(&c, 1), "", "the stale preview is cleared on the way up");
+        assert_eq!(schema_version(&c.conn), SCHEMA_VERSION);
+
+        c.conn.execute("UPDATE messages SET preview = '--b2=_boundary' WHERE uid = 1", []).unwrap();
+        Cache::upgrade(&c.conn).unwrap();
+        assert_eq!(preview_of(&c, 1), "--b2=_boundary", "a current cache is not scanned again");
+    }
+
+    #[test]
+    fn delete_messages_drops_only_those_rows_and_what_hangs_off_them() {
+        let c = Cache::in_memory().unwrap();
+        for uid in 1..=3 {
+            add_msg(&c, "INBOX", uid, "a", "s", 100);
+            c.save_body(1, "INBOX", uid, "body");
+            add_att(&c, "INBOX", uid, 0, "x.pdf", b"x");
+        }
+        add_msg(&c, "Archive", 1, "a", "s", 100);
+
+        c.delete_messages(1, "INBOX", &[1, 3]);
+
+        let left = |table: &str| -> Vec<(String, u32)> {
+            let mut stmt = c.conn.prepare(&format!("SELECT folder_path, uid FROM {table} ORDER BY folder_path, uid")).unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect()
+        };
+        assert_eq!(left("messages"), vec![("Archive".into(), 1), ("INBOX".into(), 2)]);
+        assert_eq!(left("bodies"), vec![("INBOX".into(), 2)]);
+        assert_eq!(left("attachments"), vec![("INBOX".into(), 2)]);
+    }
+
+    /// Outbox writes sync to disk, and the connection goes back to the
+    /// cheaper setting afterwards.
+    #[test]
+    fn outbox_writes_leave_the_connection_at_normal_sync() {
+        let c = Cache::in_memory().unwrap();
+        tune(&c.conn);
+        let id = c
+            .queue_outbox(1, "me@x", &["you@y".into()], "you@y", "s", "p", b"raw", None, "offline", None)
+            .unwrap();
+        c.delete_outbox(id);
+        let sync: i64 = c.conn.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+        assert_eq!(sync, 1, "NORMAL");
+        assert!(c.outbox_items(1).is_empty());
+    }
+
     fn add_att(c: &Cache, folder: &str, uid: u32, idx: u32, name: &str, data: &[u8]) {
         c.conn.execute(
             "INSERT INTO attachments (account_id, folder_path, uid, idx, name, data) VALUES (1, ?1, ?2, ?3, ?4, ?5)",

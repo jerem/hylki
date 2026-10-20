@@ -11851,9 +11851,8 @@ impl SimpleComponent for AppModel {
                 // changed list is worth re-threading and re-emitting: a
                 // rebuild of a large (or merged) list is not free, and it
                 // used to happen several times over per visit.
-                let unchanged = self.message_cache.get(&(account_id, folder_id)).is_some_and(|old| {
-                    old.len() == messages.len() && old.iter().zip(&messages).all(|(a, b)| **a == *b)
-                });
+                let (messages, unchanged) =
+                    adopt(self.message_cache.get(&(account_id, folder_id)), messages);
                 // What the badge counts when it counts arrivals (#431): the
                 // same new inbox mail as the notification above, whatever
                 // the notification settings, and only what is still in the
@@ -11879,7 +11878,6 @@ impl SimpleComponent for AppModel {
                         crate::notify::withdraw_mail(account_id);
                     }
                 }
-                let messages = shared(messages);
                 self.message_cache
                     .insert((account_id, folder_id), messages.clone());
                 // A draft picker waiting on this folder's list (Send with
@@ -26010,6 +26008,41 @@ fn view_key_of(view: UnifiedView, account: Option<u32>) -> u64 {
 /// copy every message it held, and each copy is fifteen allocations.
 fn shared(messages: Vec<Message>) -> Vec<Arc<Message>> {
     messages.into_iter().map(Arc::new).collect()
+}
+
+/// The messages a sync brought, keeping the copy already held for each one
+/// that has not changed, and whether the folder came back exactly as it was.
+///
+/// A re-sync hands over the whole folder and nearly all of it is the mail
+/// that was there before. Keeping those copies means a sync allocates only
+/// what actually changed, and leaves everything else identical by pointer,
+/// so the list can see what a sync really touched without comparing fields.
+/// This is the comparison the folder cache needed anyway to know whether
+/// anything changed at all.
+fn adopt(held: Option<&Vec<Arc<Message>>>, messages: Vec<Message>) -> (Vec<Arc<Message>>, bool) {
+    let Some(held) = held else {
+        return (shared(messages), false);
+    };
+    let by_uid: HashMap<(u32, u32), &Arc<Message>> =
+        held.iter().map(|m| ((m.account_id, m.uid), m)).collect();
+    let mut same = held.len() == messages.len();
+    let kept = messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| match by_uid.get(&(m.account_id, m.uid)) {
+            Some(before) if ***before == m => {
+                // In the same place as well as the same message: a message
+                // that only moved still leaves the folder changed.
+                same &= held.get(i).is_some_and(|at| Arc::ptr_eq(at, before));
+                Arc::clone(before)
+            }
+            _ => {
+                same = false;
+                Arc::new(m)
+            }
+        })
+        .collect();
+    (kept, same)
 }
 
 fn content_fp<'a>(msgs: impl Iterator<Item = &'a Message>) -> u64 {

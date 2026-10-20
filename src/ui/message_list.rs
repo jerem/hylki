@@ -503,6 +503,34 @@ fn compute_thread_keys<M: ThreadFields>(
     out
 }
 
+/// Whether every one of `fresh` sits below the rows on screen and joins none
+/// of their conversations, so building the list again would draw what is
+/// already there. See [`MessageList::quiet_append`].
+fn below_the_window(shown: &[Arc<Message>], fresh: &[Arc<Message>], threading: bool) -> bool {
+    let Some(oldest) = shown.iter().map(|m| m.timestamp).min() else {
+        return false;
+    };
+    if fresh.iter().any(|m| m.timestamp >= oldest) {
+        return false;
+    }
+    if !threading {
+        return true;
+    }
+    // A reply header either way round puts the new message in a conversation
+    // a row stands for, and that row then says something else.
+    let mut on_screen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for m in shown {
+        if !m.message_id.is_empty() {
+            on_screen.insert(m.message_id.as_str());
+        }
+        on_screen.extend(m.references.split_whitespace());
+    }
+    !fresh.iter().any(|m| {
+        (!m.message_id.is_empty() && on_screen.contains(m.message_id.as_str()))
+            || m.references.split_whitespace().any(|r| on_screen.contains(r))
+    })
+}
+
 /// [`SourceThreads`] worked out from `msgs` (in the list's order).
 fn source_threads_of<M: ThreadFields>(msgs: &[M], links: &[(u32, String, String)], pool: bool) -> SourceThreads {
     let keys = compute_thread_keys(msgs, links);
@@ -811,6 +839,10 @@ pub struct MessageList {
     sort: SortOrder,
     /// The header's quick filters (#97, #441).
     quick: QuickFilters,
+    /// Messages joined the list without the rows past the window being built
+    /// for them (see `quiet_append`), so `tail` is short of the list and the
+    /// next thing that needs it rebuilds first.
+    tail_stale: bool,
     /// Your contacts' addresses, lower case, while "From Contacts" is on.
     contact_addresses: Option<std::sync::Arc<std::collections::HashSet<String>>>,
     /// The last count string sent to the header bar, to emit only on change.
@@ -1990,6 +2022,7 @@ impl SimpleComponent for MessageList {
             scroller: None,
             sort: SortOrder::DateNewest,
             quick: QuickFilters::default(),
+            tail_stale: false,
             contact_addresses: None,
             last_count: String::new(),
             threading: true,
@@ -2158,15 +2191,22 @@ impl SimpleComponent for MessageList {
                 // UIDs collide across accounts in the unified inbox.
                 let existing: std::collections::HashSet<(u32, u32)> =
                     self.all.iter().map(|m| (m.account_id, m.uid)).collect();
-                let before = self.all.len();
-                for m in messages {
-                    if !existing.contains(&(m.account_id, m.uid)) {
-                        self.all.push(m);
-                    }
+                let fresh: Vec<Arc<Message>> = messages
+                    .into_iter()
+                    .filter(|m| !existing.contains(&(m.account_id, m.uid)))
+                    .collect();
+                if fresh.is_empty() {
+                    return;
                 }
                 // The list holds the whole folder, so what arrives joins it.
-                if self.all.len() != before {
-                    self.drop_threads();
+                let quiet = self.quiet_append(&fresh);
+                self.total_matches += fresh.len();
+                self.all.extend(fresh);
+                self.drop_threads();
+                if quiet {
+                    self.tail_stale = true;
+                    tracing::debug!("list: {} messages joined below the window", self.all.len());
+                } else {
                     self.queue_rebuild(true);
                 }
             }
@@ -3512,6 +3552,11 @@ impl SimpleComponent for MessageList {
                 let asked = key;
                 self.stop_checking(&sender);
                 // A row further down than the window reaches comes on screen.
+                // Messages that joined quietly are not among the rows past
+                // the window yet, and the row asked for may be one of them.
+                if self.tail_stale {
+                    self.rebuild_rows();
+                }
                 if let Some(at) = self.tail.iter().position(|r| (r.msg.account_id, r.msg.id) == key) {
                     self.grow_window(at + 1);
                 }
@@ -4351,6 +4396,14 @@ impl MessageList {
 
     /// Put up to `n` more rows on screen from the tail.
     fn grow_window(&mut self, n: usize) {
+        // Messages joined the list while it was not being built: the rows
+        // past the window are short of them, so they are built now, straight
+        // to the size being asked for.
+        if std::mem::take(&mut self.tail_stale) {
+            self.window = self.window.max(LIST_WINDOW) + n;
+            self.rebuild_rows();
+            return;
+        }
         if self.tail.is_empty() {
             return;
         }
@@ -4555,7 +4608,7 @@ impl MessageList {
     /// still being worked out.
     fn keep_view(&mut self) {
         let Some(key) = self.view_key else { return };
-        if !self.loaded || !self.query.is_empty() || self.all.is_empty() {
+        if !self.loaded || !self.query.is_empty() || self.all.is_empty() || self.tail_stale {
             return;
         }
         let threads = self.source_threads.borrow().clone();
@@ -4711,6 +4764,24 @@ impl MessageList {
         tracing::debug!("list: built ahead, {} rows of {}, in {:?}", snap.shown.len(), snap.total_matches, t.elapsed());
         self.views.retain(|v| v.key != key);
         self.views.push_back(snap);
+    }
+
+    /// Whether these new messages can join the list without it being built
+    /// again. The background index works backwards through the archive, so a
+    /// chunk of it is older than every row on screen and changes none of
+    /// them: the rows past the window are left short instead, and rebuilt by
+    /// whatever needs them next. A message that belongs to a conversation on
+    /// screen does change a row, so reply headers are checked for that.
+    fn quiet_append(&self, fresh: &[Arc<Message>]) -> bool {
+        if !self.loaded || !self.query.is_empty() || !self.quick.is_empty() {
+            return false;
+        }
+        // Only under the list's own order: any other sort can put older mail
+        // anywhere, and a search or a filter counts rows differently.
+        if self.sort != SortOrder::DateNewest || self.sort_reversed {
+            return false;
+        }
+        below_the_window(&self.shown, fresh, self.threading)
     }
 
     fn drop_threads(&self) {
@@ -5039,6 +5110,7 @@ impl MessageList {
 
     fn rebuild_rows(&mut self) {
         let t_rebuild = std::time::Instant::now();
+        self.tail_stale = false;
         let Built { rows, by_date, any_expanded } = self.compute_rows(false);
         // Only what changed reaches the view: rows that show the same message
         // stay where they are, with whatever they were doing (#323).
@@ -5641,7 +5713,7 @@ impl MessageList {
 #[cfg(test)]
 mod tests {
     use super::{
-        column_sort, compute_thread_keys, correspondents, text_key_cmp, heads_its_row, message_cmp, SortOrder, latest_elsewhere, nested_members, reader_conversation,
+        below_the_window, column_sort, compute_thread_keys, correspondents, text_key_cmp, heads_its_row, message_cmp, SortOrder, latest_elsewhere, nested_members, reader_conversation,
         row_for_reader_key, thread_slot, unasked_threads, QuickFilter, QuickFilterContext, QuickFilters,
     };
     use crate::ui::message_row::{row_edits, swap_wanted, swipe_progress_px, DaySection, RowData, RowEdit, SWIPE_ARM, SWIPE_MAX};
@@ -5816,6 +5888,43 @@ mod tests {
             due: 0,
             labels: Vec::new(),
         }
+    }
+
+    /// The background index works backwards through the archive, and a chunk
+    /// of old mail changes no row on screen — unless it belongs to a
+    /// conversation one of them stands for.
+    #[test]
+    fn old_mail_joins_the_list_without_it_being_built_again() {
+        let at = |id: u32, ts: i64| {
+            let mut m = msg(id, &format!("m{id}@x"), "");
+            m.timestamp = ts;
+            Arc::new(m)
+        };
+        let shown = vec![at(1, 5_000), at(2, 4_000)];
+
+        let old = vec![at(10, 3_000), at(11, 2_000)];
+        assert!(below_the_window(&shown, &old, true), "older mail changes nothing on screen");
+
+        // As new as the oldest row, so it belongs on screen.
+        assert!(!below_the_window(&shown, &vec![at(12, 4_000)], true));
+        assert!(!below_the_window(&shown, &vec![at(13, 9_000)], true));
+
+        // Nothing on screen to compare against.
+        assert!(!below_the_window(&[], &old, true));
+
+        // A reply to a message on screen: the row it belongs to says
+        // something else once it lands, so the list is built again.
+        let mut reply = Message::clone(&at(14, 1_000));
+        reply.references = "m1@x".into();
+        assert!(!below_the_window(&shown, &vec![Arc::new(reply.clone())], true));
+        // The other way round: a row answers the message that arrived.
+        let mut answered = Message::clone(&at(15, 1_000));
+        answered.message_id = "earlier@x".into();
+        let mut head = Message::clone(&shown[0]);
+        head.references = "earlier@x".into();
+        assert!(!below_the_window(&[Arc::new(head)], &vec![Arc::new(answered)], true));
+        // With conversations off, no row speaks for another message.
+        assert!(below_the_window(&shown, &vec![Arc::new(reply)], false));
     }
 
     /// #334: every sort keeps its key, a heading sorts by its column (the

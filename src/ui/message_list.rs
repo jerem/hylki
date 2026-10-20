@@ -1583,6 +1583,9 @@ pub enum MessageListInput {
     NearEnd,
     /// A large list's conversations, worked out off the main loop.
     ThreadsReady { gen: u64, threads: Box<SourceThreads> },
+    /// Hand the reader the conversation of the row it is showing, now that
+    /// the conversations are known.
+    ReopenConversation,
     /// Mark which message is being viewed so it stays highlighted across
     /// rebuilds; `None` clears the selection (e.g. on folder switch).
     SetSelected(Option<u32>),
@@ -2270,7 +2273,29 @@ impl SimpleComponent for MessageList {
                 if gen == self.threads_gen.get() && threads.pool == self.searching_pool() {
                     *self.source_threads.borrow_mut() = Some(std::rc::Rc::new(*threads));
                     self.queue_rebuild(true);
+                    // A row opened before this landed was shown on its own.
+                    sender.input(MessageListInput::ReopenConversation);
                 }
+            }
+            MessageListInput::ReopenConversation => {
+                // The conversations are known now. A row opened while they
+                // were still being worked out went to the reader by itself;
+                // hand over the rest of what it stands for.
+                let Some(key) = self.selected_id else { return };
+                if self.emitted_thread.len() > 1 {
+                    return;
+                }
+                let Some(m) =
+                    self.shown.iter().find(|m| (m.account_id, m.id) == key).map(|m| Message::clone(m))
+                else {
+                    return;
+                };
+                let (thread, solo) = self.conversation_for(&m);
+                if thread.len() <= 1 {
+                    return;
+                }
+                self.emitted_thread = thread.iter().map(|t| (t.account_id, t.id)).collect();
+                let _ = sender.output(MessageListOutput::Selected { message: m, thread, solo });
             }
             MessageListInput::AskThreads => {
                 // Only the conversations rows have come to show, and only once
@@ -5568,7 +5593,7 @@ impl MessageList {
             return None;
         }
         let m = self.active_source().iter().find(|m| (m.account_id, m.id) == key)?;
-        let threads = self.source_threads();
+        let threads = self.threads_if_known()?;
         let thread = threads.keys.get(&thread_slot(m))?;
         self.shown
             .iter()
@@ -5619,7 +5644,14 @@ impl MessageList {
     /// Everything in `active_source` that shares `m`'s conversation, `m`
     /// included, in source order. Empty when `m` is not in the source.
     fn source_members(&self, m: &Message) -> Vec<Message> {
-        let threads = self.source_threads();
+        // Only from conversations already worked out: a click must not be
+        // what works out every conversation in the mailbox, which for a
+        // large one is close to a second with the window held. The row opens
+        // on its own and the rest of its conversation joins it when the
+        // answer lands (see `ReopenConversation`).
+        let Some(threads) = self.threads_if_known() else {
+            return Vec::new();
+        };
         let source = self.active_source();
         threads
             .keys

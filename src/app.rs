@@ -21365,25 +21365,33 @@ impl AppModel {
         // put every message's reply headers here, to be cloned on each sync and
         // walked on each rebuild. A conversation is joined by mail near it in
         // time, so the newest links are the ones that do the joining.
-        let mut recent: Vec<&Message> = self
+        let mut recent: Vec<&Arc<Message>> = self
             .message_cache
             .values()
             .flatten()
-            .map(|m| m.as_ref())
             .filter(|m| !(m.message_id.is_empty() && m.references.is_empty()))
             .collect();
+        // Newest first, and settled: the same mail has to come out in the
+        // same order every time, or the list would read every sync as a
+        // change and work out every conversation again. Ties are broken by
+        // where the message is, which nothing else decides.
+        let newest_first = |a: &&Arc<Message>, b: &&Arc<Message>| {
+            b.timestamp
+                .cmp(&a.timestamp)
+                .then(a.account_id.cmp(&b.account_id))
+                .then(a.folder_id.cmp(&b.folder_id))
+                .then(a.uid.cmp(&b.uid))
+        };
         // The newest few, picked without sorting the lot: across every
         // folder held that is hundreds of thousands of messages.
         if recent.len() > THREAD_LINK_LIMIT {
-            recent.select_nth_unstable_by(THREAD_LINK_LIMIT, |a, b| b.timestamp.cmp(&a.timestamp));
+            recent.select_nth_unstable_by(THREAD_LINK_LIMIT, newest_first);
             recent.truncate(THREAD_LINK_LIMIT);
         }
-        let mut links: Vec<(u32, String, String)> = recent
-            .into_iter()
-            .map(|m| (m.account_id, m.message_id.clone(), m.references.clone()))
-            .collect();
-        links.sort();
-        links.dedup();
+        recent.sort_unstable_by(newest_first);
+        // The messages themselves: a sync that changed none of them hands
+        // the list the very same ones, which it answers by doing nothing.
+        let links: Vec<Arc<Message>> = recent.into_iter().map(Arc::clone).collect();
         self.message_list.emit(MessageListInput::SetThreadLinks(links));
     }
 

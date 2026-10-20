@@ -417,7 +417,7 @@ impl ThreadFields for ThreadInput {
 
 fn compute_thread_keys<M: ThreadFields>(
     msgs: &[M],
-    links: &[(u32, String, String)],
+    links: &[Arc<Message>],
 ) -> std::collections::HashMap<(u32, u32, u32), (u32, String)> {
     use std::collections::HashMap;
 
@@ -485,10 +485,10 @@ fn compute_thread_keys<M: ThreadFields>(
     // Messages from elsewhere in the account contribute their links but never
     // appear: a reply in the Inbox and the one before it are two answers to the
     // same message in Sent, and without that message nothing says so.
-    for (aid, id, refs) in links {
-        let sn = forest.node(Node::Id(*aid, id));
-        for r in refs.split_whitespace() {
-            let rn = forest.node(Node::Id(*aid, r));
+    for m in links {
+        let sn = forest.node(Node::Id(m.account_id, &m.message_id));
+        for r in m.references.split_whitespace() {
+            let rn = forest.node(Node::Id(m.account_id, r));
             forest.union(sn, rn);
         }
     }
@@ -535,7 +535,7 @@ fn below_the_window(shown: &[Arc<Message>], fresh: &[Arc<Message>], threading: b
 }
 
 /// [`SourceThreads`] worked out from `msgs` (in the list's order).
-fn source_threads_of<M: ThreadFields>(msgs: &[M], links: &[(u32, String, String)], pool: bool) -> SourceThreads {
+fn source_threads_of<M: ThreadFields>(msgs: &[M], links: &[Arc<Message>], pool: bool) -> SourceThreads {
     let keys = compute_thread_keys(msgs, links);
     let mut members: std::collections::HashMap<(u32, String), Vec<usize>> = std::collections::HashMap::new();
     for (i, m) in msgs.iter().enumerate() {
@@ -724,7 +724,12 @@ pub struct MessageList {
     /// folders. A conversation is often joined through messages that aren't on
     /// screen — every reply in an Inbox answers something in Sent — so those
     /// links are needed to see that the replies belong together.
-    thread_links: Vec<(u32, String, String)>,
+    /// Reply headers from mail outside this list, as the messages holding
+    /// them. The messages themselves, rather than copies of their headers:
+    /// a sync leaves every message it did not change alone (see the app's
+    /// `adopt`), so the list can tell one sync's links from the last by
+    /// pointer, and a sync that changed none of them costs nothing here.
+    thread_links: Vec<Arc<Message>>,
     /// The conversations of everything the list holds, worked out once and
     /// kept until the messages or the links change. Opening a message asks
     /// which conversation it belongs to, and grouping a large folder from
@@ -1341,7 +1346,7 @@ pub enum MessageListInput {
     ResolveDelete,
     /// Reply headers from the account's other folders, so a conversation joined
     /// through a message that isn't on screen still groups.
-    SetThreadLinks(Vec<(u32, String, String)>),
+    SetThreadLinks(Vec<Arc<Message>>),
     /// What the whole conversations look like from the cache, keyed by thread
     /// key (#222, #236).
     SetThreadSummaries(Vec<((u32, String), ThreadSummary)>),
@@ -2321,7 +2326,9 @@ impl SimpleComponent for MessageList {
                 self.report_thread_growth(&sender);
             }
             MessageListInput::SetThreadLinks(links) => {
-                if self.thread_links != links {
+                let same = self.thread_links.len() == links.len()
+                    && self.thread_links.iter().zip(&links).all(|(a, b)| Arc::ptr_eq(a, b));
+                if !same {
                     self.thread_links = links;
                     self.drop_threads();
                     if self.threading {
@@ -4645,7 +4652,13 @@ impl MessageList {
             self.contact_addresses.as_ref().map_or(0, |c| c.len()),
         )
         .hash(&mut h);
-        self.thread_links.hash(&mut h);
+        // By where they are, not what they say: the same messages are the
+        // same links, and reading twenty thousand headers to answer this
+        // would cost more than the question is worth.
+        self.thread_links.len().hash(&mut h);
+        for l in &self.thread_links {
+            (Arc::as_ptr(l) as usize).hash(&mut h);
+        }
         crate::datefmt::day_key(crate::datefmt::now()).hash(&mut h);
         h.finish()
     }
@@ -6090,9 +6103,10 @@ mod tests {
         );
 
         // Sent 2 replied to reply-a, which replied to Sent 1: one conversation.
+        // The two in Sent, which this list does not hold.
         let links = vec![
-            (1u32, "sent-1@us".to_string(), String::new()),
-            (1u32, "sent-2@us".to_string(), "sent-1@us reply-a@them".to_string()),
+            Arc::new(msg(101, "sent-1@us", "")),
+            Arc::new(msg(102, "sent-2@us", "sent-1@us reply-a@them")),
         ];
         let joined = compute_thread_keys(&shown, &links);
         assert_eq!(
@@ -6213,7 +6227,7 @@ mod tests {
     #[test]
     fn links_do_not_merge_unrelated_conversations() {
         let shown = [msg(1, "a@x", ""), msg(2, "b@x", "")];
-        let links = vec![(1u32, "c@x".to_string(), "a@x".to_string())];
+        let links = vec![Arc::new(msg(103, "c@x", "a@x"))];
         let keys = compute_thread_keys(&shown, &links);
         assert_ne!(keys.get(&(1, 1, 1)), keys.get(&(1, 1, 2)), "still two conversations");
     }

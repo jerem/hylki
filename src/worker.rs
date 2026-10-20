@@ -1329,6 +1329,13 @@ async fn run_imap(
     // Set after prefetching; triggers one re-sync (to catch mail that arrived
     // while the connection was busy) before settling into the long IDLE.
     let mut pending_resync = false;
+    // What was last handed to the app for each folder, as one number. A
+    // background resync that finds the folder exactly as it was has nothing
+    // to say, and saying it anyway costs the window a great deal: the whole
+    // folder crosses to the main thread, where every message is compared
+    // against the copy already held and then thrown away.
+    let mut sent_state: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     // Whether to use IMAP's structured ENVELOPE/BODYSTRUCTURE. Disabled for the
     // session (falling back to raw-header parsing) if the server sends responses
     // our IMAP parser can't handle (e.g. iCloud), and remembered across
@@ -1616,7 +1623,16 @@ async fn run_imap(
                                 cache.as_ref(), &emit,
                             )
                             .await;
-                            emit(WorkerEvent::Messages { folder_id: fid, messages });
+                            let state = folder_state(&messages);
+                            if sent_state.insert(fpath.clone(), state) != Some(state) {
+                                emit(WorkerEvent::Messages { folder_id: fid, messages });
+                            } else {
+                                tracing::debug!(
+                                    account_id,
+                                    folder = %fpath,
+                                    "resync: the folder is as it was, nothing to hand over"
+                                );
+                            }
                         }
                         continue;
                     }
@@ -1922,6 +1938,9 @@ async fn run_imap(
                         // list stops showing the spinner once it holds a full
                         // page anyway.
                         let complete = messages.len() < FIRST_PAGE as usize;
+                        // Asked for: always handed over, so a folder the app
+                        // has lost is always answered.
+                        sent_state.insert(path.clone(), folder_state(&messages));
                         emit(WorkerEvent::Messages { folder_id, messages });
                         if complete {
                             emit(WorkerEvent::BackfillDone { folder_id });
@@ -3964,6 +3983,25 @@ fn pgp_notice(status: &crate::models::PgpStatus) -> String {
 /// keyring as it stood the first time, for ever.
 fn body_cacheable(check: &crate::models::SenderCheck) -> bool {
     check.pgp.is_none()
+}
+
+/// Everything about a folder the app would draw differently, as one number:
+/// which messages it holds, in which order, and the state of each. Cheap
+/// beside the comparison it saves, and it reads no message body.
+fn folder_state(messages: &[Message]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    messages.len().hash(&mut h);
+    for m in messages {
+        (m.uid, m.id, m.timestamp, m.importance.to_i64(), m.due).hash(&mut h);
+        (m.unread, m.starred, m.answered, m.forwarded, m.has_attachment).hash(&mut h);
+        (&m.keywords, &m.labels).hash(&mut h);
+        // Lengths, not the text: a subject or a preview that changed changed
+        // its length too, barring a coincidence that costs one extra sync.
+        (m.subject.len(), m.preview.len(), m.from_addr.len(), m.from_name.len()).hash(&mut h);
+        (m.message_id.len(), m.references.len(), m.to.len(), m.cc.len()).hash(&mut h);
+    }
+    h.finish()
 }
 
 /// The attachments of a raw message, through any OpenPGP wrapping, and

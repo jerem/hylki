@@ -1719,13 +1719,13 @@ impl SimpleComponent for MessageList {
                     // the list shows them.
                     gtk::Button {
                         #[watch]
-                        set_icon_name: if model.selection_any_unread() {
+                        set_icon_name: if model.selection_shows_unread() {
                             "hylki-mail-read-symbolic"
                         } else {
                             "mail-unread-symbolic"
                         },
                         #[watch]
-                        set_tooltip_text: Some(if model.selection_any_unread() { i18n("Mark as Read") } else { i18n("Mark as Unread") }.as_str()),
+                        set_tooltip_text: Some(if model.selection_shows_unread() { i18n("Mark as Read") } else { i18n("Mark as Unread") }.as_str()),
                         add_css_class: "flat",
                         set_focus_on_click: false,
                         #[watch]
@@ -3880,6 +3880,24 @@ impl MessageList {
 
     /// Whether any selected message is unread, so the bulk read toggle
     /// marks the selection read rather than unread.
+    /// What the Mark as Read button shows, which the view asks after every
+    /// update. Until a large list's conversations are in, it speaks for the
+    /// rows alone and settles a moment later, rather than working out every
+    /// conversation in the mailbox to answer a button's icon.
+    fn selection_shows_unread(&self) -> bool {
+        let positions = self.selected_positions();
+        if positions.iter().any(|&p| self.shown.get(p).is_some_and(|m| m.unread)) {
+            return true;
+        }
+        if !self.threading {
+            return false;
+        }
+        let Some(threads) = self.threads_if_known() else {
+            return false;
+        };
+        self.any_unread_in_conversations(&positions, &threads)
+    }
+
     fn selection_any_unread(&self) -> bool {
         // The rows first: asked on every update, and a row's own message
         // usually answers it.
@@ -3893,6 +3911,12 @@ impl MessageList {
         // Then the rest of each conversation a row stands for, as
         // `selected_conversations` gathers it, without copying any.
         let threads = self.source_threads();
+        self.any_unread_in_conversations(&positions, &threads)
+    }
+
+    /// Whether any message hidden inside the selected rows' conversations is
+    /// unread.
+    fn any_unread_in_conversations(&self, positions: &[usize], threads: &SourceThreads) -> bool {
         let source = self.active_source();
         positions.iter().filter_map(|&p| self.shown.get(p)).any(|m| {
             let key = (m.account_id, m.id);
@@ -4754,6 +4778,21 @@ impl MessageList {
 
     fn searching_pool(&self) -> bool {
         self.wants_pool() && !self.search_pool.is_empty()
+    }
+
+    /// The conversations of `active_source`, but only when they are already
+    /// worked out, or cheap enough to work out in place. A large list has
+    /// them worked out on a background thread (see
+    /// [`MessageList::threads_pending`]), and a question asked on every
+    /// update must not be the thing that pays for them: for a mailbox of a
+    /// few hundred thousand messages that is close to half a second, on the
+    /// main thread, after every sync.
+    fn threads_if_known(&self) -> Option<std::rc::Rc<SourceThreads>> {
+        let pool = self.searching_pool();
+        if let Some(t) = self.source_threads.borrow().as_ref().filter(|t| t.pool == pool) {
+            return Some(t.clone());
+        }
+        (self.active_source().len() < THREADS_OFF_MAIN).then(|| self.source_threads())
     }
 
     /// The conversations of `active_source`, from the kept copy while the

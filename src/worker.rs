@@ -7845,6 +7845,29 @@ async fn refresh_keywords(
 /// walk's place: empty starts a fresh pass over the cached folder list, and
 /// what is left when a request interrupts is resumed by the next call.
 /// Returns the folders whose counts moved and whether the pass finished.
+/// What a folder's chip should say, asked without opening the folder: one
+/// round trip where opening it and searching it is two, and opening it also
+/// puts aside whatever mailbox the session had selected, which the next read
+/// then has to take back. A mailbox the server will not answer for falls back
+/// to opening it (RFC 3501, STATUS).
+async fn status_chip(
+    session: &mut ImapSession,
+    path: &str,
+    kind: FolderKind,
+) -> Option<(u32, Option<u32>)> {
+    const ITEMS: &str = "(MESSAGES UNSEEN UIDNEXT)";
+    let cmd = format!("STATUS {} {ITEMS}", quote_mailbox(path));
+    wire(&cmd);
+    let r = session.status(path, ITEMS).await;
+    wired(&cmd, &r);
+    let mb = r.ok()?;
+    // Drafts counts every message it holds; everything else counts unseen.
+    // In a STATUS answer UNSEEN is how many there are, where in a SELECT it
+    // is where the first one sits.
+    let unread = if chip_counts_all(kind) { mb.exists } else { mb.unseen? };
+    Some((unread, mb.uid_next))
+}
+
 async fn refresh_unread_counts(
     account_id: u32,
     session: &mut ImapSession,
@@ -7869,15 +7892,26 @@ async fn refresh_unread_counts(
         if Some(f.path.as_str()) == selected {
             continue;
         }
-        let Ok(mb) = exam(session, &f.path).await else {
-            tracing::debug!("sweep: cannot examine {}", f.path);
-            continue;
+        let asked = match status_chip(session, &f.path, f.kind).await {
+            Some(answer) => Some(answer),
+            None => {
+                // The server would not answer for it: open it and look.
+                match exam(session, &f.path).await {
+                    Ok(mb) => selected_chip_count(session, Some(f.kind))
+                        .await
+                        .map(|unread| (unread, mb.uid_next)),
+                    Err(_) => {
+                        tracing::debug!("sweep: cannot examine {}", f.path);
+                        None
+                    }
+                }
+            }
         };
-        let Some(unread) = selected_chip_count(session, Some(f.kind)).await else {
+        let Some((unread, uid_next)) = asked else {
             continue;
         };
         emit(WorkerEvent::FolderUnread { folder_id: f.id, unread });
-        let now = (unread, mb.uid_next);
+        let now = (unread, uid_next);
         match baseline.insert(f.path.clone(), now) {
             Some(prev) if prev != now => {
                 tracing::debug!("sweep: {} moved {:?} -> {:?}", f.path, prev, now);

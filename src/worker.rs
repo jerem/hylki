@@ -1924,13 +1924,39 @@ async fn run_imap(
                                 // QRESYNC adds. A message expunged and none
                                 // put in its place shows in the count.
                                 let state = (mb.uid_validity.unwrap_or(0), now, mb.exists);
-                                if folder_state_seen.get(&path) == Some(&state) {
+                                let touched = match folder_state_seen.get(&path).copied() {
+                                    // The same run of uids and the same
+                                    // number of messages, so none came or
+                                    // went; what is left to ask is whether
+                                    // any of them is marked differently.
+                                    Some((run, was, count))
+                                        if run == state.0 && count == state.2 =>
+                                    {
+                                        if was == now {
+                                            Some(false)
+                                        } else {
+                                            touched_since(
+                                                &mut session.as_mut().unwrap(),
+                                                account_id,
+                                                &path,
+                                                was,
+                                                cache.as_ref(),
+                                            )
+                                            .await
+                                        }
+                                    }
+                                    // Never looked at, a different run of
+                                    // uids, or a message came or went.
+                                    _ => None,
+                                };
+                                if touched == Some(false) {
                                     tracing::debug!(
                                         account_id,
                                         folder = %path,
                                         modseq = now,
-                                        "refresh: unchanged since the last look, not read"
+                                        "refresh: nothing in it has changed, not read"
                                     );
+                                    folder_state_seen.insert(path.clone(), state);
                                     continue;
                                 }
                                 tracing::debug!(
@@ -3108,6 +3134,56 @@ async fn enable_condstore(account_id: u32, session: &mut ImapSession) {
             on.insert(account_id);
         }
     }
+}
+
+/// Whether anything in this folder that the list draws has changed since the
+/// modification sequence `since`.
+///
+/// The sequence alone does not answer it. A server counts a change to any
+/// message in the mailbox, and Gmail moves it for its own reasons: five
+/// minutes of an untouched inbox moved it a hundred times while every
+/// message in it stayed exactly as it was. What the sequence does give is a
+/// short list of which messages it counted, and those few can be compared
+/// against what is held (RFC 7162, CHANGEDSINCE).
+///
+/// `None` when the server would not answer, which reads the folder as before.
+async fn touched_since(
+    session: &mut ImapSession,
+    account_id: u32,
+    path: &str,
+    since: u64,
+    cache: Option<&Cache>,
+) -> Option<bool> {
+    let cache = cache?;
+    let stream = fetch_uids(session, "1:*", format!("(UID FLAGS) (CHANGEDSINCE {since})")).await.ok()?;
+    let fetches = stream.try_collect::<Vec<Fetch>>().await.ok()?;
+    if fetches.is_empty() {
+        return Some(false);
+    }
+    let counted: Vec<(u32, Vec<Flag>)> =
+        fetches.iter().filter_map(|f| Some((f.uid?, f.flags().collect()))).collect();
+    let uids: Vec<u32> = counted.iter().map(|(uid, _)| *uid).collect();
+    let held = cache.cached_flags(account_id, path, &uids);
+    for (uid, flags) in counted {
+        // One the folder does not hold is a message that arrived.
+        let Some((unread, starred, answered, forwarded, keywords)) = held.get(&uid) else {
+            return Some(true);
+        };
+        let now_unread = !flags.iter().any(|f| matches!(f, Flag::Seen));
+        let now_starred = flags.iter().any(|f| matches!(f, Flag::Flagged));
+        let now_answered = flags.iter().any(|f| matches!(f, Flag::Answered));
+        let mut now_keywords = custom_flags(&flags);
+        let now_forwarded = now_keywords.iter().any(|k| k.eq_ignore_ascii_case(FORWARDED_KEYWORD));
+        let mut held_keywords = keywords.clone();
+        now_keywords.sort();
+        held_keywords.sort();
+        if (now_unread, now_starred, now_answered, now_forwarded, now_keywords)
+            != (*unread, *starred, *answered, *forwarded, held_keywords)
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// Whether the server agreed to report modification sequences.

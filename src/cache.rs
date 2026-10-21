@@ -1301,6 +1301,42 @@ impl Cache {
         run().unwrap_or_default()
     }
 
+    /// What this folder's cached messages are marked with, by UID: read,
+    /// starred, answered, forwarded, and the server keywords. Only the
+    /// messages asked for, so a sync that hears a handful have changed can
+    /// check them without reading the folder.
+    pub fn cached_flags(
+        &self,
+        account_id: u32,
+        folder_path: &str,
+        uids: &[u32],
+    ) -> std::collections::HashMap<u32, (bool, bool, bool, bool, Vec<String>)> {
+        if uids.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let run = || -> rusqlite::Result<std::collections::HashMap<u32, (bool, bool, bool, bool, Vec<String>)>> {
+            let list = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT uid, unread, starred, answered, forwarded, {KEYWORDS_COL} FROM messages \
+                 WHERE account_id = ?1 AND folder_path = ?2 AND uid IN ({list})"
+            ))?;
+            let rows = stmt.query_map(params![account_id, folder_path], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    (
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
+                        split_keywords(row.get::<_, String>(5)?),
+                    ),
+                ))
+            })?;
+            rows.collect()
+        };
+        run().unwrap_or_default()
+    }
+
     /// Each cached message's UID with its timestamp, for a folder: what a
     /// Graph or JMAP listing is reconciled against (#429), since a row newer
     /// than the listing itself must not be taken for one deleted.

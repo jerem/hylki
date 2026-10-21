@@ -1933,7 +1933,20 @@ async fn run_imap(
                                     );
                                     continue;
                                 }
+                                tracing::debug!(
+                                    account_id,
+                                    folder = %path,
+                                    modseq = now,
+                                    exists = mb.exists,
+                                    "refresh: changed since the last look, reading it"
+                                );
                                 folder_state_seen.insert(path.clone(), state);
+                            } else {
+                                tracing::debug!(
+                                    account_id,
+                                    folder = %path,
+                                    "refresh: the server counts no changes, reading it"
+                                );
                             }
                         }
                         // Let the read below surface it.

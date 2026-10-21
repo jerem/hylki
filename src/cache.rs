@@ -299,7 +299,7 @@ const THREAD_ID_LIMIT: usize = 24;
 /// How many messages one conversation may pull in from other folders. A
 /// conversation is rendered as a single document with every member's body
 /// inlined, so this bounds both the fetching and the rendering.
-const THREAD_MEMBER_LIMIT: usize = 100;
+pub(crate) const THREAD_MEMBER_LIMIT: usize = 100;
 
 /// Most Message-IDs one *batched* conversation count matches against, across
 /// every thread on the page put together (#222). The references half of the
@@ -1345,11 +1345,33 @@ impl Cache {
         ids: &[String],
     ) -> Vec<(String, Message)> {
         let ids: Vec<&String> = ids.iter().filter(|i| !i.is_empty()).take(THREAD_ID_LIMIT).collect();
+        self.thread_messages(account_id, &ids, THREAD_MEMBER_LIMIT as i64)
+    }
+
+    /// The members of several conversations at once, for a whole page of
+    /// them: one pass over the account's reply headers, where asking per
+    /// conversation meant one pass each and a page of two hundred took the
+    /// best part of a minute (#222).
+    pub fn messages_by_thread_ids_batched(
+        &self,
+        account_id: u32,
+        ids: &[&String],
+        row_limit: i64,
+    ) -> Vec<(String, Message)> {
+        self.thread_messages(account_id, ids, row_limit)
+    }
+
+    fn thread_messages(
+        &self,
+        account_id: u32,
+        ids: &[&String],
+        row_limit: i64,
+    ) -> Vec<(String, Message)> {
         if ids.is_empty() {
             return Vec::new();
         }
         let run = || -> rusqlite::Result<Vec<(String, Message)>> {
-            let members = self.thread_member_rowids(account_id, &ids)?;
+            let members = self.thread_member_rowids(account_id, ids)?;
             if members.is_empty() {
                 return Ok(Vec::new());
             }
@@ -1361,7 +1383,7 @@ impl Cache {
                 members = rowid_list(&members),
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map([THREAD_MEMBER_LIMIT as i64], |row| {
+            let rows = stmt.query_map([row_limit], |row| {
                 let uid: u32 = row.get(1)?;
                 let mut m = Message {
                         id: uid,

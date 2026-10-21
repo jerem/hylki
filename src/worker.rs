@@ -1014,6 +1014,10 @@ fn related_from_cache(cache: &Cache, account_id: u32, ids: &[String]) -> Vec<Mes
 
 /// [`related_from_cache`] over an already loaded folder list, leaving out the
 /// folders of the `skipped` kinds.
+/// Most messages one page of conversations may bring in all together. Each
+/// conversation still takes at most [`THREAD_MEMBER_LIMIT`] of them.
+const THREAD_PAGE_MEMBER_LIMIT: i64 = 5_000;
+
 fn related_in(
     cache: &Cache,
     account_id: u32,
@@ -1051,12 +1055,47 @@ fn thread_summaries_with_members(
     }
     let folders = cache.load_folders(account_id);
     let skipped = [FolderKind::Trash, FolderKind::Junk, FolderKind::Drafts, FolderKind::Templates];
+    // Every conversation on the page in one pass. Asking for each one's
+    // members on its own read the account's reply headers once per
+    // conversation, which for a page of two hundred was three quarters of a
+    // minute of the thread that answers these.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let wanted: Vec<&String> = groups
+        .iter()
+        .filter(|(t, _)| summaries.iter().any(|(tag, s)| tag == t && s.count >= 2))
+        .flat_map(|(_, ids)| ids.iter())
+        .filter(|id| !id.is_empty() && seen.insert(id.as_str()))
+        .collect();
+    let pool: Vec<Message> = cache
+        .messages_by_thread_ids_batched(account_id, &wanted, THREAD_PAGE_MEMBER_LIMIT)
+        .into_iter()
+        .filter_map(|(path, mut m)| {
+            let f = folders.iter().find(|f| f.path == path)?;
+            if skipped.contains(&f.kind) {
+                return None;
+            }
+            m.folder_id = f.id;
+            Some(m)
+        })
+        .collect();
     for (tag, summary) in &mut summaries {
         if summary.count < 2 {
             continue;
         }
         if let Some((_, ids)) = groups.iter().find(|(t, _)| t == tag) {
-            summary.members = related_in(cache, account_id, &folders, ids, &skipped);
+            // The same rule the query matched on: the id itself, or the id
+            // named in someone's References.
+            let want: std::collections::HashSet<&str> =
+                ids.iter().map(|i| i.as_str()).filter(|i| !i.is_empty()).collect();
+            summary.members = pool
+                .iter()
+                .filter(|m| {
+                    want.contains(m.message_id.as_str())
+                        || m.references.split_whitespace().any(|r| want.contains(r))
+                })
+                .take(crate::cache::THREAD_MEMBER_LIMIT)
+                .cloned()
+                .collect();
         }
     }
     summaries

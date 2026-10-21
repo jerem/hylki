@@ -5283,6 +5283,11 @@ impl MessageList {
             self.graph_in_view = graph_in_view;
             self.sync_look();
         }
+        // Rows are built as far as the window reaches plus what scrolling is
+        // likely to want, and no further: a mailbox's own list is hundreds of
+        // thousands of rows, and building every one of them was the greater
+        // part of this.
+        let horizon = self.window.max(LIST_WINDOW).saturating_add(ROWS_AHEAD);
         let sort = self.sort;
         let reversed = self.sort_reversed;
         let flip = |order: std::cmp::Ordering| if reversed { order.reverse() } else { order };
@@ -5319,22 +5324,54 @@ impl MessageList {
             own_keys = compute_thread_keys(&matches, &self.thread_links);
             &own_keys
         };
-        let key_for = |m: &Message| -> (u32, String) {
-            keys.get(&thread_slot(m))
-                .cloned()
-                .unwrap_or_else(|| (m.account_id, format!("\u{0}uid{}/{}", m.folder_id, m.uid)))
-        };
-        let mut order: Vec<(u32, String)> = Vec::new();
-        let mut groups: std::collections::HashMap<(u32, String), Vec<Arc<Message>>> =
+        // What a message is grouped by, borrowed: naming a conversation
+        // costs a String, and a mailbox has hundreds of thousands of them to
+        // walk past for the few whose rows are built.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum GroupKey<'a> {
+            Thread(u32, &'a str),
+            Lone(u32, u32, u32),
+        }
+        let selected: std::collections::HashSet<(u32, u32)> =
+            self.selected_ids.iter().copied().chain(self.selected_id).collect();
+        let mut index: std::collections::HashMap<GroupKey<'_>, usize> =
             std::collections::HashMap::new();
+        let mut opened: Vec<GroupKey<'_>> = Vec::new();
+        let mut members: Vec<Vec<Arc<Message>>> = Vec::new();
+        // Conversations are opened only as far as rows will be built, plus
+        // whatever the selection needs: past that a message joins one already
+        // opened or is left for the next build (see `tail_short`).
+        let mut capped = false;
         for m in matches {
-            let key = key_for(&m);
-            if let Some(v) = groups.get_mut(&key) {
-                v.push(m);
-            } else {
-                order.push(key.clone());
-                groups.insert(key, vec![m]);
+            let gk = match keys.get(&thread_slot(&m)) {
+                Some((aid, name)) => GroupKey::Thread(*aid, name.as_str()),
+                None => GroupKey::Lone(m.account_id, m.folder_id, m.uid),
+            };
+            if let Some(&i) = index.get(&gk) {
+                members[i].push(m);
+                continue;
             }
+            if opened.len() >= horizon && !selected.contains(&(m.account_id, m.id)) {
+                capped = true;
+                continue;
+            }
+            index.insert(gk, members.len());
+            opened.push(gk);
+            members.push(vec![m]);
+        }
+        // Named here, where there are only as many as will be shown.
+        let mut order: Vec<(u32, String)> = Vec::with_capacity(opened.len());
+        let mut groups: std::collections::HashMap<(u32, String), Vec<Arc<Message>>> =
+            std::collections::HashMap::with_capacity(opened.len());
+        for (gk, msgs) in opened.iter().zip(members) {
+            let key = match gk {
+                GroupKey::Thread(aid, name) => (*aid, (*name).to_string()),
+                GroupKey::Lone(aid, folder_id, uid) => {
+                    (*aid, format!("\u{0}uid{folder_id}/{uid}"))
+                }
+            };
+            order.push(key.clone());
+            groups.insert(key, msgs);
         }
         // Correspondents sort by the whole conversation's writers, as the
         // column names them, which no single message knows (#443). The
@@ -5376,12 +5413,7 @@ impl MessageList {
         ));
         let mut any_expanded = false;
         let full_rows = self.window.max(LIST_WINDOW);
-        // Rows are built as far as the window reaches plus what scrolling is
-        // likely to want, and no further: a mailbox's own list is hundreds of
-        // thousands of rows, and building every one of them was the greater
-        // part of this.
-        let horizon = full_rows.saturating_add(ROWS_AHEAD);
-        let mut short = false;
+        let mut short = capped;
         let mut unseen: std::collections::HashSet<(u32, u32)> =
             self.selected_ids.iter().copied().chain(self.selected_id).collect();
         for key in &order {

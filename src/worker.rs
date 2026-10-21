@@ -1984,10 +1984,21 @@ async fn run_imap(
                         // list stops showing the spinner once it holds a full
                         // page anyway.
                         let complete = messages.len() < FIRST_PAGE as usize;
-                        // Asked for: always handed over, so a folder the app
-                        // has lost is always answered.
-                        sent_state.insert(path.clone(), folder_state(&messages));
-                        emit(WorkerEvent::Messages { folder_id, messages });
+                        let state = folder_state(&messages);
+                        let as_before = sent_state.insert(path.clone(), state) == Some(state);
+                        // A background refresh that found the folder as it was
+                        // has nothing to say, and saying it costs the window
+                        // the whole folder. One the app asked for is always
+                        // handed over, so a folder it has lost is answered.
+                        if background && as_before {
+                            tracing::debug!(
+                                account_id,
+                                folder = %path,
+                                "refresh: the folder is as it was, nothing to hand over"
+                            );
+                        } else {
+                            emit(WorkerEvent::Messages { folder_id, messages });
+                        }
                         if complete {
                             emit(WorkerEvent::BackfillDone { folder_id });
                         }

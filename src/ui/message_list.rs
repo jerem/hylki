@@ -4881,7 +4881,10 @@ impl MessageList {
     }
 
     fn drop_threads(&self) {
-        self.source_threads.take();
+        // Freeing them is a name per message, so they go after the frame
+        // rather than holding it: for a list of a few hundred thousand that
+        // is a quarter of a second, and this runs in the middle of a sync.
+        later_drop(self.source_threads.take());
         self.threads_gen.set(self.threads_gen.get() + 1);
     }
 

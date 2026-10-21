@@ -4012,22 +4012,6 @@ impl MessageList {
         self.any_unread_in_conversations(&positions, &threads)
     }
 
-    fn selection_any_unread(&self) -> bool {
-        // The rows first: asked on every update, and a row's own message
-        // usually answers it.
-        let positions = self.selected_positions();
-        if positions.iter().any(|&p| self.shown.get(p).is_some_and(|m| m.unread)) {
-            return true;
-        }
-        if !self.threading {
-            return false;
-        }
-        // Then the rest of each conversation a row stands for, as
-        // `selected_conversations` gathers it, without copying any.
-        let threads = self.source_threads();
-        self.any_unread_in_conversations(&positions, &threads)
-    }
-
     /// Counting the members a collapsed row hides, which is what the rows
     /// themselves cannot answer.
     fn any_unread_in_conversations(&self, positions: &[usize], threads: &SourceThreads) -> bool {

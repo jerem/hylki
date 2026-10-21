@@ -1422,7 +1422,6 @@ async fn run_imap(
             }
             backfill.push_back(Backfill {
                 folder_id: f.id,
-                gallery: gallery_folder(f.kind),
                 path: f.path.clone(),
                 remaining: None,
             });
@@ -1620,7 +1619,6 @@ async fn run_imap(
                             &account,
                             account_id,
                             cache.as_ref(),
-                            &mut prefetch,
                             &mut use_envelope,
                             &emit,
                         ), &mut rx, &mut backlog).await;
@@ -1934,7 +1932,6 @@ async fn run_imap(
                         if backfill_seen.insert(path.clone()) {
                             backfill.push_back(Backfill {
                                 folder_id,
-                                gallery: folder_is_gallery(cache.as_ref(), account_id, &path),
                                 path: path.clone(),
                                 remaining: None,
                             });
@@ -3423,27 +3420,6 @@ fn queue_body_prefetch(
 
 /// Queue the newest messages that have attachments (not already cached) for
 /// background attachment pre-download, so new mail's attachments are ready too.
-/// Whether a folder's attachments feed the gallery (so its mail is worth
-/// prefetching): everything except Trash, Junk and Drafts.
-fn gallery_folder(kind: crate::models::FolderKind) -> bool {
-    use crate::models::FolderKind::*;
-    !matches!(kind, Trash | Junk | Drafts)
-}
-
-/// Gallery eligibility of a folder by path, looked up from the cached folder list.
-/// Unknown folders default to eligible.
-fn folder_is_gallery(cache: Option<&Cache>, account_id: u32, path: &str) -> bool {
-    cache
-        .map(|c| {
-            c.load_folders(account_id)
-                .iter()
-                .find(|f| f.path == path)
-                .map(|f| gallery_folder(f.kind))
-                .unwrap_or(true)
-        })
-        .unwrap_or(true)
-}
-
 fn queue_attachment_prefetch(
     queue: &mut std::collections::VecDeque<(String, u32)>,
     path: &str,
@@ -9188,9 +9164,6 @@ struct Backfill {
     folder_id: u32,
     path: String,
     remaining: Option<Vec<u32>>,
-    /// Whether this folder feeds the attachments gallery (not Trash/Junk/Drafts);
-    /// if so, its backfilled messages' attachments are prefetched too.
-    gallery: bool,
 }
 
 // select! may receive a reader before polling the job at all. In that case
@@ -9307,7 +9280,6 @@ async fn run_one_backfill(
     account: &AccountConfig,
     account_id: u32,
     cache: Option<&Cache>,
-    prefetch: &mut std::collections::VecDeque<(String, u32)>,
     use_envelope: &mut bool,
     emit: &impl Fn(WorkerEvent),
 ) {
@@ -9360,11 +9332,16 @@ async fn run_one_backfill(
             if let Some(c) = cache {
                 c.upsert_messages(account_id, &job.path, &msgs);
             }
-            // Gallery folders: queue this chunk's attachments for background
-            // download so they appear in the attachments gallery.
-            if job.gallery {
-                queue_attachment_prefetch(prefetch, &job.path, &msgs, cache, account_id);
-            }
+            // The bytes are not fetched here. The gallery lists an
+            // attachment from what the scan read out of its BODYSTRUCTURE,
+            // and fetches it when it is opened; indexing a mailbox is no
+            // reason to download them. Doing it per chunk meant up to
+            // [`PREFETCH_LIMIT`] whole messages for every
+            // [`BACKFILL_CHUNK`] indexed, which over an archive of a few
+            // hundred thousand is thousands of messages downloaded in full
+            // for thumbnails nobody asked for. The folder on show still
+            // prefetches its newest, where it is a reader about to open
+            // them rather than an index walking past.
             emit(WorkerEvent::MessagesAppend {
                 folder_id: job.folder_id,
                 messages: msgs,
@@ -14887,7 +14864,7 @@ mod reader_preemption_tests {
     #[tokio::test(start_paused = true)]
     async fn cancelled_backfill_restores_drained_uids_without_duplicate_jobs() {
         let job = Backfill {
-            folder_id: 1, path: "INBOX".into(), remaining: Some(vec![3, 2, 1]), gallery: false,
+            folder_id: 1, path: "INBOX".into(), remaining: Some(vec![3, 2, 1]),
         };
         let mut queue = std::collections::VecDeque::from([job.clone()]);
         // Cancellation before the future's first poll leaves the job queued.

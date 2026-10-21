@@ -1382,6 +1382,14 @@ async fn run_imap(
     // against the copy already held and then thrown away.
     let mut sent_state: std::collections::HashMap<String, u64> =
         std::collections::HashMap::new();
+    // What the server last said a folder's state was: how many times it has
+    // changed (its modification sequence) and which run of uids that counts
+    // for. Asking is one round trip and answers the whole question, where
+    // finding out by reading the folder is the greater part of a sync. Kept
+    // for the session only: a start reads every folder once, which is also
+    // how anything missed while the app was closed is caught.
+    let mut folder_state_seen: std::collections::HashMap<String, (u32, u64, u32)> =
+        std::collections::HashMap::new();
     // Whether to use IMAP's structured ENVELOPE/BODYSTRUCTURE. Disabled for the
     // session (falling back to raw-header parsing) if the server sends responses
     // our IMAP parser can't handle (e.g. iCloud), and remembered across
@@ -1898,6 +1906,39 @@ async fn run_imap(
             | MailRequest::SyncFolder { folder_id, path } => {
                 if !background {
                     emit(WorkerEvent::Status(i18n("Syncing…")));
+                }
+                // A refresh nobody is waiting on asks the server whether the
+                // folder has changed at all before reading any of it. On a
+                // server that counts changes this is one round trip against
+                // a full uid search, a window fetch and the folder read out
+                // of the cache.
+                if background && condstore_on(account_id) {
+                    match sel(&mut session.as_mut().unwrap(), &path).await {
+                        Ok(mb) => {
+                            if let Some(now) = mb.highest_modseq {
+                                // The count as well as the sequence. A
+                                // sequence counts what changed about the
+                                // messages that are there, and a server
+                                // offering CONDSTORE alone need not move it
+                                // for one that was taken away: that is what
+                                // QRESYNC adds. A message expunged and none
+                                // put in its place shows in the count.
+                                let state = (mb.uid_validity.unwrap_or(0), now, mb.exists);
+                                if folder_state_seen.get(&path) == Some(&state) {
+                                    tracing::debug!(
+                                        account_id,
+                                        folder = %path,
+                                        modseq = now,
+                                        "refresh: unchanged since the last look, not read"
+                                    );
+                                    continue;
+                                }
+                                folder_state_seen.insert(path.clone(), state);
+                            }
+                        }
+                        // Let the read below surface it.
+                        Err(e) => tracing::debug!(account_id, folder = %path, "select failed: {e}"),
+                    }
                 }
                 // Fast first page (or a recent-window refresh over the cached
                 // index); the background backfill indexes the rest of the folder.
@@ -3031,6 +3072,39 @@ async fn run_imap(
 /// fresh `Folders` event only when the listing differs from the cache (so an
 /// unchanged list doesn't trigger a redundant UI rebuild). Returns `None` (after
 /// emitting an error) if the connection could not be established.
+/// Ask the server to report a mailbox's modification sequence, which is one
+/// number saying whether anything in it has changed at all: a message added,
+/// removed, or a flag turned over. Without it the only way to find out is to
+/// read the mailbox, which for a large folder is the greater part of what a
+/// sync costs (RFC 7162).
+///
+/// Servers that do not offer it are left alone and sync as they always did.
+async fn enable_condstore(account_id: u32, session: &mut ImapSession) {
+    let offered = session
+        .capabilities()
+        .await
+        .is_ok_and(|caps| caps.has_str("CONDSTORE"));
+    if !offered {
+        return;
+    }
+    wire("ENABLE CONDSTORE");
+    let result = session.run_command_and_check_ok("ENABLE CONDSTORE").await;
+    wired("ENABLE CONDSTORE", &result);
+    if result.is_ok() {
+        if let Ok(mut on) = CONDSTORE.lock() {
+            on.insert(account_id);
+        }
+    }
+}
+
+/// Whether the server agreed to report modification sequences.
+fn condstore_on(account_id: u32) -> bool {
+    CONDSTORE.lock().map(|on| on.contains(&account_id)).unwrap_or(false)
+}
+
+static CONDSTORE: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
 async fn connect_and_list(
     account_id: u32,
     account: &AccountConfig,
@@ -3053,6 +3127,7 @@ async fn connect_and_list(
                 label: account.display_label(),
                 accent: accent_for(account_id).into(),
             }));
+            enable_condstore(account_id, &mut session).await;
             let cached = cache.map(|c| c.load_folders(account_id)).unwrap_or_default();
             match list_folder_metadata(
                 account_id, &mut session, &account.folder_roles, &account.hidden_folders, Some(&cached),

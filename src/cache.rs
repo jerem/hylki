@@ -236,11 +236,12 @@ const ACCOUNT_TABLES: [&str; 11] = [
 /// answered on email.a1.net was flagged). Suspicious verdicts stored earlier,
 /// and the bodies served with them, are dropped once so those messages are
 /// checked again when next opened; every other cached body stays.
+/// v22: nothing stored changes. Columns were added by earlier builds without
+/// a bump, and the upgrade runs only when this number moves, so one bump makes
+/// every cache pick them up.
 /// v23: `messages_refs_scan`, the index the conversation badges read.
-/// v22: nothing stored changes. The upgrade in [`Cache::migrate`] now runs
-/// only when this number differs from the file's, not on every open, so the
-/// bump makes every cache run it once more and pick up the columns added
-/// without one. Raise this with every new `ALTER TABLE` there.
+/// Raise this for a new `ALTER TABLE` in [`Cache::migrate`] too: the bump is
+/// the only thing that runs it.
 const SCHEMA_VERSION: i64 = 23;
 
 /// The newest version whose change altered how bodies are *rendered* or how
@@ -313,10 +314,11 @@ const THREAD_COUNT_ID_LIMIT: usize = 256;
 /// so this is the whole page's budget, not one thread's.
 const THREAD_COUNT_ROW_LIMIT: i64 = 5_000;
 
-/// (Adding a *new* table needs no bump: `SCHEMA` runs `CREATE TABLE IF NOT
-/// EXISTS` on every open, so an existing cache gains it in place. A bump is for
-/// changing or invalidating what is already stored — it costs users a re-render
-/// or a re-sync.)
+/// (Anything added to `SCHEMA` needs a bump, a table and an index as much as
+/// a column: it runs inside [`Cache::migrate`], which runs only when
+/// [`SCHEMA_VERSION`] moves, so without one an existing cache never gains it.
+/// Weigh the bump against what it costs, which for a version at or above
+/// `LAYOUT_VERSION` is a re-render rather than a re-sync.)
 ///
 /// The first version whose table *layout* matches the current `SCHEMA`. At or
 /// above this, an upgrade only needs to drop the derived caches, not the
@@ -636,7 +638,7 @@ impl Cache {
         // Wait for a worker's write instead of failing at once. Everything
         // below shares this file with the account workers, the upgrade too.
         conn.busy_timeout(Duration::from_secs(5))?;
-        // Concurrency: multiple account workers share this file.
+        // WAL, so a reader is not held up while a worker writes.
         let _ = conn.pragma_update(None, "journal_mode", "WAL");
         tune(&conn);
         Self::upgrade(&conn)?;
@@ -819,7 +821,35 @@ impl Cache {
                 [],
             );
         }
+        // Only once every column this version expects is really there. The
+        // steps above ignore their errors because adding a column that is
+        // already there is an error and the expected outcome, but "already
+        // there" and "the file was locked" look alike from here, and this
+        // number is what decides whether they are ever tried again. Stamping
+        // it after a failure would leave a column missing for good.
+        if let Err(e) = Self::columns_present(conn) {
+            tracing::warn!("cache: upgrade unfinished, leaving the version as it was: {e}");
+            return Ok(());
+        }
         let _ = conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"));
+        Ok(())
+    }
+
+    /// Whether the columns the upgrade adds are all there, as a plain read of
+    /// each. An empty table answers as well as a full one.
+    fn columns_present(conn: &Connection) -> rusqlite::Result<()> {
+        let reads = [
+            "SELECT reply_to, keywords, importance, due, gmail_labels, answered, forwarded, bcc, \
+             preview FROM messages LIMIT 1",
+            "SELECT pgp, invite, label FROM sender_checks LIMIT 1",
+            "SELECT send_at, forwards FROM outbox LIMIT 1",
+        ];
+        for sql in reads {
+            match conn.query_row(sql, [], |_| Ok(())) {
+                Ok(()) | Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 
@@ -1184,7 +1214,6 @@ impl Cache {
                 tx.prepare_cached("INSERT OR REPLACE INTO msgid_case (lower, exact) VALUES (?1, ?2)")?
                     .execute(params![lower, exact])?;
             }
-            // Prepared once for the whole batch, not once per row.
             // Upsert rather than REPLACE so an empty preview cannot erase one
             // already stored: the background backfill re-fetches summaries
             // without asking for a body slice, and every message it touched
@@ -3478,6 +3507,24 @@ mod tests {
         c.conn.execute("UPDATE messages SET preview = '--b2=_boundary' WHERE uid = 1", []).unwrap();
         Cache::upgrade(&c.conn).unwrap();
         assert_eq!(preview_of(&c, 1), "--b2=_boundary", "a current cache is not scanned again");
+    }
+
+    /// A column the upgrade could not add leaves the version where it was, so
+    /// the next open tries again rather than recording work that never
+    /// happened.
+    #[test]
+    fn an_unfinished_upgrade_does_not_stamp_the_version() {
+        let c = Cache::in_memory().unwrap();
+        assert!(Cache::columns_present(&c.conn).is_ok(), "a current cache has them all");
+
+        // As a cache that never gained one of them looks.
+        c.conn.execute_batch("ALTER TABLE messages DROP COLUMN bcc;").unwrap();
+        assert!(Cache::columns_present(&c.conn).is_err());
+        c.conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        Cache::migrate(&c.conn, 6).unwrap();
+        // migrate adds it back, so the version moves.
+        assert!(Cache::columns_present(&c.conn).is_ok());
+        assert_eq!(schema_version(&c.conn), SCHEMA_VERSION);
     }
 
     #[test]

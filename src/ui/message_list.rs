@@ -345,8 +345,9 @@ struct ViewSnapshot {
     total_matches: usize,
     thread_drag: crate::ui::message_row::ThreadDragKeys,
     window: usize,
-    /// Its rows stop short of its messages (see [`ROWS_AHEAD`]).
+    /// Its rows were never built for the messages that joined last.
     tail_stale: bool,
+    /// Its rows stop at [`ROWS_AHEAD`] past its window.
     tail_short: bool,
 }
 
@@ -2225,11 +2226,18 @@ impl SimpleComponent for MessageList {
                 let quiet = self.quiet_append(&fresh);
                 self.total_matches += fresh.len();
                 self.all.extend(fresh);
-                self.drop_threads();
                 if quiet {
+                    // The conversations held describe the rows on screen,
+                    // which these messages are not among, so they stay.
+                    // Dropping them here would leave the list with none and
+                    // nothing to work them out again, since only a rebuild
+                    // starts that, and a quiet append is one that does not
+                    // rebuild. The rebuild that does build these rows drops
+                    // them first.
                     self.tail_stale = true;
                     tracing::debug!("list: {} messages joined below the window", self.all.len());
                 } else {
+                    self.drop_threads();
                     self.queue_rebuild(true);
                 }
             }
@@ -2273,7 +2281,6 @@ impl SimpleComponent for MessageList {
                 if gen == self.threads_gen.get() && threads.pool == self.searching_pool() {
                     *self.source_threads.borrow_mut() = Some(std::rc::Rc::new(*threads));
                     self.queue_rebuild(true);
-                    // A row opened before this landed was shown on its own.
                     sender.input(MessageListInput::ReopenConversation);
                 }
             }
@@ -3113,7 +3120,7 @@ impl SimpleComponent for MessageList {
             }
 
             MessageListInput::BulkToggleRead => {
-                let action = if self.selection_any_unread() {
+                let action = if self.selection_shows_unread() {
                     BulkAction::MarkRead
                 } else {
                     BulkAction::MarkUnread
@@ -3606,9 +3613,16 @@ impl SimpleComponent for MessageList {
                     || (self.tail_short
                         && !self.tail.iter().any(|r| (r.msg.account_id, r.msg.id) == key))
                 {
-                    if let Some(at) = self.all.iter().position(|m| (m.account_id, m.id) == key) {
-                        self.window = self.window.max(at + 1);
+                    // Where the row sits among the rows is not where its
+                    // message sits in the list: under any sort but the
+                    // list's own the two are unrelated, and conversations
+                    // move a row to wherever its newest member puts it. So
+                    // the list is built out in full for this one rebuild
+                    // rather than guessed at.
+                    if std::mem::take(&mut self.tail_stale) {
+                        self.drop_threads();
                     }
+                    self.window = self.total_matches.max(LIST_WINDOW);
                     self.rebuild_rows();
                 }
                 if let Some(at) = self.tail.iter().position(|r| (r.msg.account_id, r.msg.id) == key) {
@@ -4014,8 +4028,8 @@ impl MessageList {
         self.any_unread_in_conversations(&positions, &threads)
     }
 
-    /// Whether any message hidden inside the selected rows' conversations is
-    /// unread.
+    /// Counting the members a collapsed row hides, which is what the rows
+    /// themselves cannot answer.
     fn any_unread_in_conversations(&self, positions: &[usize], threads: &SourceThreads) -> bool {
         let source = self.active_source();
         positions.iter().filter_map(|&p| self.shown.get(p)).any(|m| {
@@ -4059,7 +4073,7 @@ impl MessageList {
                 // Drafts are neither read nor unread.
                 // One entry, the way the bar's button toggles.
                 if !self.in_drafts {
-                    section.push(if self.selection_any_unread() {
+                    section.push(if self.selection_shows_unread() {
                         item(BulkAction::MarkRead, &i18n("Mark as Read"), "hylki-mail-read-symbolic")
                     } else {
                         item(BulkAction::MarkUnread, &i18n("Mark as Unread"), "mail-unread-symbolic")
@@ -4478,8 +4492,13 @@ impl MessageList {
         // ran out with more of the list behind them: either way the rows are
         // built now, straight to the size being asked for.
         let short_of_rows = self.tail_short && self.tail.len() < n;
-        if std::mem::take(&mut self.tail_stale) || short_of_rows {
+        let joined = std::mem::take(&mut self.tail_stale);
+        if joined || short_of_rows {
             self.window = self.window.max(LIST_WINDOW) + n;
+            // Messages that joined quietly are in no conversation yet.
+            if joined {
+                self.drop_threads();
+            }
             self.rebuild_rows();
             return;
         }
@@ -4925,8 +4944,9 @@ impl MessageList {
     /// worked out, or cheap enough to work out in place. A large list has
     /// them worked out on a background thread (see
     /// [`MessageList::threads_pending`]), and a question asked on every
-    /// update must not be the thing that pays for them: for 342k messages
-    /// that is close to half a second, on the main thread, after every sync.
+    /// update must not be the thing that pays for them: past
+    /// [`THREADS_OFF_MAIN`] that is a pause on the main thread, after every
+    /// sync.
     fn threads_if_known(&self) -> Option<std::rc::Rc<SourceThreads>> {
         let pool = self.searching_pool();
         if let Some(t) = self.source_threads.borrow().as_ref().filter(|t| t.pool == pool) {
@@ -5334,6 +5354,8 @@ impl MessageList {
         }
         let selected: std::collections::HashSet<(u32, u32)> =
             self.selected_ids.iter().copied().chain(self.selected_id).collect();
+        let mut selected_here: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::new();
         let mut index: std::collections::HashMap<GroupKey<'_>, usize> =
             std::collections::HashMap::new();
         let mut opened: Vec<GroupKey<'_>> = Vec::new();
@@ -5343,6 +5365,9 @@ impl MessageList {
         // opened or is left for the next build (see `tail_short`).
         let mut capped = false;
         for m in matches {
+            if selected.contains(&(m.account_id, m.id)) {
+                selected_here.insert((m.account_id, m.id));
+            }
             let gk = match keys.get(&thread_slot(&m)) {
                 Some((aid, name)) => GroupKey::Thread(*aid, name.as_str()),
                 None => GroupKey::Lone(m.account_id, m.folder_id, m.uid),
@@ -5414,8 +5439,11 @@ impl MessageList {
         let mut any_expanded = false;
         let full_rows = self.window.max(LIST_WINDOW);
         let mut short = capped;
-        let mut unseen: std::collections::HashSet<(u32, u32)> =
-            self.selected_ids.iter().copied().chain(self.selected_id).collect();
+        // Only the selected rows this list actually holds. One it does not
+        // (a reply picked out of an opened conversation, or a message a sync
+        // took away) would otherwise never be found, holding every row open
+        // to be built and described in full.
+        let mut unseen = selected_here;
         for key in &order {
             // Past the horizon, once every selected row has been built (the
             // selection has to be reachable, however far down it sits).
@@ -5678,7 +5706,7 @@ impl MessageList {
     fn source_members(&self, m: &Message) -> Vec<Message> {
         // Only from conversations already worked out: a click must not be
         // what works out every conversation in the mailbox, which for a
-        // large one is close to a second with the window held. The row opens
+        // large one is a visible pause with the window held. The row opens
         // on its own and the rest of its conversation joins it when the
         // answer lands (see `ReopenConversation`).
         let Some(threads) = self.threads_if_known() else {

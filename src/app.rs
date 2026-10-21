@@ -11314,11 +11314,11 @@ impl SimpleComponent for AppModel {
                 if self.prefs.is_some() {
                     return;
                 }
-                // Not while the start is still landing. Building this window
-                // is a third of a second of widgets, and spending it between
-                // the first syncs is what makes the window feel stuck; the
-                // point of building it early is a Settings click that opens
-                // at once, and that is just as true a few seconds later.
+                // Not while the start is still landing: building this window
+                // is long enough that spending it between the first syncs is
+                // what makes the window feel stuck. The point of building it
+                // early is a Settings click that opens at once, and that is
+                // just as true a few seconds later.
                 if self.starting_up() {
                     let s = sender.input_sender().clone();
                     gtk::glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
@@ -21402,6 +21402,9 @@ impl AppModel {
     fn forget_threads(&mut self, account_id: u32) {
         self.thread_cache.retain(|(aid, _, _), _| *aid != account_id);
         self.thread_cache_order.retain(|(aid, _, _)| *aid != account_id);
+        // The badges counted those conversations, so the page has to be
+        // asked about again even though it is the same page.
+        self.thread_summaries_asked = None;
     }
 
     /// Whether the start is still landing: folders still to read, views
@@ -21428,8 +21431,8 @@ impl AppModel {
             .flatten()
             .filter(|m| !(m.message_id.is_empty() && m.references.is_empty()))
             .collect();
-        // Newest first, and settled: the same mail has to come out in the
-        // same order every time, or the list would read every sync as a
+        // Settled as well as newest first: the same mail has to come out in
+        // the same order every time, or the list would read every sync as a
         // change and work out every conversation again. Ties are broken by
         // where the message is, which nothing else decides.
         let newest_first = |a: &&Arc<Message>, b: &&Arc<Message>| {
@@ -26082,8 +26085,9 @@ fn view_key_of(view: UnifiedView, account: Option<u32>) -> u64 {
 /// thousands of messages, against a merge and a regrouping many times that.
 /// One shared copy of each message for the caches, the unified view and the
 /// list to hand between them. A message is copied once, when it arrives, and
-/// every hand-off after that is a pointer: merging the unified view used to
-/// copy every message it held, and each copy is fifteen allocations.
+/// every hand-off after that is a pointer. A message owns a dozen strings, so
+/// merging the unified view by value copied all of them, for every message it
+/// held.
 fn shared(messages: Vec<Message>) -> Vec<Arc<Message>> {
     messages.into_iter().map(Arc::new).collect()
 }

@@ -1096,6 +1096,13 @@ fn thread_summaries_with_members(
                 .take(crate::cache::THREAD_MEMBER_LIMIT)
                 .cloned()
                 .collect();
+            // The page's pass has a budget of its own, and a few large
+            // conversations can spend it before the older ones further down
+            // are reached. One that came back with nothing, while its badge
+            // counts more than one, is asked for on its own as it used to be.
+            if summary.members.is_empty() {
+                summary.members = related_in(cache, account_id, &folders, ids, &skipped);
+            }
         }
     }
     summaries
@@ -1388,15 +1395,12 @@ async fn run_imap(
     // Queue every known folder for background indexing so search covers the whole
     // mailbox shortly after the first sync (like Apple Mail). The backfill skips
     // UIDs already cached, so this is cheap on subsequent runs.
-    for f in cache
-        .as_ref()
-        .map(|c| c.load_folders(account_id))
-        .unwrap_or_default()
-    {
+    let known_folders = cache.as_ref().map(|c| c.load_folders(account_id)).unwrap_or_default();
+    for f in &known_folders {
         // A Gmail label holds the same mail as All Mail, which is indexed
         // beside it: walking them all is the same messages over again. Opening
         // one indexes it, through the folder sync below.
-        if gmail_label_folder(account_id, f.kind) {
+        if gmail_label_folder(account_id, f.kind, &known_folders) {
             tracing::debug!(account_id, folder = %f.path, "a label, indexed when opened");
             continue;
         }
@@ -1419,7 +1423,7 @@ async fn run_imap(
             backfill.push_back(Backfill {
                 folder_id: f.id,
                 gallery: gallery_folder(f.kind),
-                path: f.path,
+                path: f.path.clone(),
                 remaining: None,
             });
         }
@@ -1701,6 +1705,10 @@ async fn run_imap(
                     {
                         IdleOutcome::Request(req) => req,
                         IdleOutcome::Refreshed | IdleOutcome::Quiet => {
+                            // IDLE hands the folder over itself when mail
+                            // lands, so what a refresh last sent is no longer
+                            // what the app holds.
+                            sent_state.remove(&fpath);
                             // IDLE only watches one folder; mail filed by
                             // server-side rules lands in the others without ever
                             // waking it. Re-check their unread chips whenever
@@ -2344,6 +2352,7 @@ async fn run_imap(
                                 if let Some(c) = cache.as_ref() {
                                     c.upsert_messages(account_id, &path, &messages);
                                 }
+                                sent_state.clear();
                                 emit(WorkerEvent::Messages { folder_id, messages });
                             }
                         }
@@ -2701,6 +2710,7 @@ async fn run_imap(
                         if let Some(c) = cache.as_ref() {
                             c.upsert_messages(account_id, &dest, &messages);
                         }
+                        sent_state.clear();
                         emit(WorkerEvent::Messages { folder_id: dest_folder_id, messages });
                         emit(WorkerEvent::Restored {
                             folder_id: dest_folder_id,
@@ -2765,6 +2775,7 @@ async fn run_imap(
                             }
                         }
                         tracing::info!("emptied {path}: {} message(s) erased", uids.len());
+                        sent_state.clear();
                         emit(WorkerEvent::Messages { folder_id, messages: Vec::new() });
                         emit(WorkerEvent::FolderUnread { folder_id, unread: 0 });
                     }
@@ -2837,6 +2848,7 @@ async fn run_imap(
                         )
                         .await
                         {
+                            sent_state.clear();
                             emit(WorkerEvent::Messages { folder_id: o.folder_id, messages });
                         }
                     }
@@ -2890,6 +2902,7 @@ async fn run_imap(
                                     if let Some(c) = cache.as_ref() {
                                         c.upsert_messages(account_id, &o.path, &messages);
                                     }
+                                    sent_state.clear();
                                     emit(WorkerEvent::Messages { folder_id: o.folder_id, messages });
                                 }
                             }
@@ -2969,6 +2982,7 @@ async fn run_imap(
                                     if let Some(c) = cache.as_ref() {
                                         c.upsert_messages(account_id, &path, &messages);
                                     }
+                                    sent_state.clear();
                                     emit(WorkerEvent::Messages { folder_id, messages });
                                 }
                                 // Surface a newly-created Drafts folder in the sidebar.
@@ -3199,8 +3213,15 @@ async fn load_bodies_retry(
 /// its first hours doing. The mail itself is in All Mail, which is indexed
 /// as always; a label is indexed when it is opened, which the folder's own
 /// sync already arranges.
-fn gmail_label_folder(account_id: u32, kind: FolderKind) -> bool {
-    gmail_labels_wanted(account_id) && matches!(kind, FolderKind::Custom | FolderKind::Starred)
+fn gmail_label_folder(account_id: u32, kind: FolderKind, folders: &[Folder]) -> bool {
+    if !gmail_labels_wanted(account_id) || !matches!(kind, FolderKind::Custom | FolderKind::Starred) {
+        return false;
+    }
+    // Only when All Mail is there to be indexed in their place. A Gmail
+    // account can be set to keep it out of IMAP, and then the labels are the
+    // only place that mail is listed: skipping them would leave the index
+    // with the Inbox and little else.
+    folders.iter().any(|f| f.kind == FolderKind::Archive)
 }
 
 pub(crate) fn has_gmail_labels(account: &AccountConfig, folders: &[Folder]) -> bool {
@@ -4067,10 +4088,13 @@ fn folder_state(messages: &[Message]) -> u64 {
         (m.uid, m.id, m.timestamp, m.importance.to_i64(), m.due).hash(&mut h);
         (m.unread, m.starred, m.answered, m.forwarded, m.has_attachment).hash(&mut h);
         (&m.keywords, &m.labels).hash(&mut h);
-        // Lengths, not the text: a subject or a preview that changed changed
-        // its length too, barring a coincidence that costs one extra sync.
-        (m.subject.len(), m.preview.len(), m.from_addr.len(), m.from_name.len()).hash(&mut h);
-        (m.message_id.len(), m.references.len(), m.to.len(), m.cc.len()).hash(&mut h);
+        // The text itself, not its length: a preview filled in later or a
+        // subject decoded again is a row that reads differently, and two of
+        // them sharing a length would leave the app showing the old one for
+        // as long as nothing else about the folder changed.
+        (&m.subject, &m.preview, &m.from_addr, &m.from_name).hash(&mut h);
+        (&m.message_id, &m.references, &m.to, &m.cc, &m.bcc, &m.reply_to).hash(&mut h);
+        (&m.date, &m.body).hash(&mut h);
     }
     h.finish()
 }

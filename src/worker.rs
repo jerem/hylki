@@ -1393,6 +1393,13 @@ async fn run_imap(
         .map(|c| c.load_folders(account_id))
         .unwrap_or_default()
     {
+        // A Gmail label holds the same mail as All Mail, which is indexed
+        // beside it: walking them all is the same messages over again. Opening
+        // one indexes it, through the folder sync below.
+        if gmail_label_folder(account_id, f.kind) {
+            tracing::debug!(account_id, folder = %f.path, "a label, indexed when opened");
+            continue;
+        }
         if backfill_seen.insert(f.path.clone()) {
             // Messages indexed before Hylki fetched References thread by their
             // immediate parent alone — which for an incoming reply is usually
@@ -3171,6 +3178,20 @@ async fn load_bodies_retry(
 
 /// Whether the account is Gmail, where a folder is a label and one message
 /// sits in several of them at once.
+/// Whether this folder is one of a Gmail account's labels rather than a
+/// place of its own.
+///
+/// Gmail files one message under every label it wears, so a message with
+/// three labels is a message in four mailboxes: All Mail and each label.
+/// Indexing them all downloads its headers, stores its row and searches it
+/// four times over, and that is most of what a large Gmail account spends
+/// its first hours doing. The mail itself is in All Mail, which is indexed
+/// as always; a label is indexed when it is opened, which the folder's own
+/// sync already arranges.
+fn gmail_label_folder(account_id: u32, kind: FolderKind) -> bool {
+    gmail_labels_wanted(account_id) && matches!(kind, FolderKind::Custom | FolderKind::Starred)
+}
+
 pub(crate) fn has_gmail_labels(account: &AccountConfig, folders: &[Folder]) -> bool {
     let host = account.imap_host.to_ascii_lowercase();
     host.ends_with("gmail.com")
